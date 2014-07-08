@@ -33,6 +33,7 @@
 #include "pt_image.h"
 #include "pt_retstack.h"
 #include "pt_ild.h"
+#include "pt_observer.h"
 
 #include <inttypes.h>
 
@@ -58,6 +59,9 @@ struct pt_insn_decoder {
 
 	/* The Intel(R) Processor Trace instruction (length) decoder. */
 	struct pt_ild ild;
+
+	/* The attached decode observers. */
+	struct pt_obsv_collection observers;
 
 	/* The current IP. */
 	uint64_t ip;
