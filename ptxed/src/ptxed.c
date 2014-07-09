@@ -30,6 +30,10 @@
 # include "load_elf.h"
 #endif /* defined(FEATURE_ELF) */
 
+#if defined(FEATURE_PEVENT)
+# include "ptxed_pevent.h"
+#endif /* defined(FEATURE_PEVENT) */
+
 #include "pt_cpu.h"
 
 #include "intel-pt.h"
@@ -70,6 +74,14 @@ struct ptxed_options {
 
 	/* Print the raw bytes for an insn. */
 	uint32_t print_raw_insn:1;
+
+#if defined(FEATURE_PEVENT)
+	/* We have a primary sideband file. */
+	uint32_t pevent_have_primary:1;
+
+	/* We have a kcore file. */
+	uint32_t pevent_have_kcore:1;
+#endif /* defined(FEATURE_PEVENT) */
 };
 
 /* A collection of statistics. */
@@ -78,6 +90,88 @@ struct ptxed_stats {
 	uint64_t insn;
 };
 
+/* A collection of decode observers. */
+struct ptxed_obsv {
+	/* The next observer in a linear list. */
+	struct ptxed_obsv *next;
+
+	/* The decode observer. */
+	struct pt_observer *obsv;
+
+	/* A function for providing the decoder to observe.
+	 *
+	 * This is used for allocating observers before the observed decoder
+	 * to avoid an ordering requirement on ptxed options.
+	 */
+	int (*obsv_set_decoder)(struct pt_observer *, struct pt_insn_decoder *);
+
+	/* The dtor for @obsv. */
+	void (*obsv_dtor)(struct pt_observer *);
+};
+
+#if defined(FEATURE_PEVENT)
+
+static struct ptxed_obsv *
+ptxed_obsv_alloc(struct pt_observer *obsv, struct ptxed_obsv *next,
+		 int (*obsv_set_decoder)(struct pt_observer *,
+					 struct pt_insn_decoder *),
+		 void (*obsv_dtor)(struct pt_observer *))
+{
+	struct ptxed_obsv *list;
+
+	list = malloc(sizeof(*list));
+	if (list) {
+		list->next = next;
+		list->obsv = obsv;
+		list->obsv_set_decoder = obsv_set_decoder;
+		list->obsv_dtor = obsv_dtor;
+	}
+
+	return list;
+}
+
+#endif /* defined(FEATURE_PEVENT) */
+
+static void ptxed_obsv_free(struct ptxed_obsv *list)
+{
+	while (list) {
+		struct ptxed_obsv *trash;
+
+		trash = list;
+		list = list->next;
+
+		if (trash->obsv_dtor)
+			trash->obsv_dtor(trash->obsv);
+		free(trash);
+	}
+}
+
+static int ptxed_obsv_attach(struct ptxed_obsv *list,
+			     struct pt_insn_decoder *decoder, const char *prog)
+{
+	for (; list; list = list->next) {
+		int errcode;
+
+		if (list->obsv_set_decoder) {
+			errcode = list->obsv_set_decoder(list->obsv, decoder);
+			if (errcode < 0) {
+				fprintf(stderr,
+					"%s: error preparing observer: %s.\n",
+					prog, pt_errstr(pt_errcode(errcode)));
+				return errcode;
+			}
+		}
+
+		errcode = pt_insn_attach_obsv(decoder, list->obsv);
+		if (errcode < 0) {
+			fprintf(stderr, "%s: failed to attach observer: %s.\n",
+				prog, pt_errstr(pt_errcode(errcode)));
+			return errcode;
+		}
+	}
+
+	return 0;
+}
 
 static void version(const char *name)
 {
@@ -108,6 +202,31 @@ static void help(const char *name)
 	       "                                use the default load address if <base> is omitted.\n"
 #endif /* defined(FEATURE_ELF) */
 	       "  --raw <file>:<base>           load a raw binary from <file> at address <base>.\n"
+#if defined(FEATURE_PEVENT)
+	       "  --pevent:primary <file>[:<from>[-<to>]]\n"
+	       "                                load a perf_event primary sideband stream from <file>.\n"
+	       "                                (e.g. the sideband for the traced cpu).\n"
+	       "                                an optional offset or range can be given.\n"
+	       "  --pevent:secondary <file>[:<from>[-<to>]]\n"
+	       "                                load a perf_event secondary sideband stream from <file>.\n"
+	       "                                (e.g. the sideband for another cpu).\n"
+	       "                                an optional offset or range can be given.\n"
+	       "  --pevent:sample-type <val>    set the perf_event_attr sample_type to <val> (default: 0).\n"
+	       "  --pevent:time-zero <val>      set the perf_event_mmap_page's time_zero to <val> (default: 0).\n"
+	       "  --pevent:time-shift <val>     set the perf_event_mmap_page's time_shift to <val> (default: 0).\n"
+	       "  --pevent:time-mult <val>      set the perf_event_mmap_page's time_mult to <val> (default: 1).\n"
+	       "  --pevent:tsc-offset <val>     process perf events <val> ticks earlier.\n"
+	       "  --pevent:kernel-start <val>   set the kernel start address to <val>.\n"
+	       "  --pevent:vdso <file>          load the vdso from <file>.\n"
+	       "  --pevent:sysroot <dir>        prepend <dir> to perf event file names.\n"
+#  if defined(FEATURE_ELF)
+	       "  --pevent:kcore <file>         load kcore from <file>.\n"
+	       "                                an optional base address may be specified.\n"
+#  endif /* defined(FEATURE_ELF) */
+	       "  --pevent:ring-0               specify that the trace contains ring-0 code.\n"
+	       "  --pevent:ring-3               specify that the trace contains ring-3 code.\n"
+	       "  --pevent:flags <val>          set sideband decoder (debug) flags to <val>.\n"
+#endif /* defined(FEATURE_PEVENT) */
 	       "  --cpu none|auto|f/m[/s]       set cpu to the given value and decode according to:\n"
 	       "                                  none     spec (default)\n"
 	       "                                  auto     current cpu\n"
@@ -122,6 +241,12 @@ static void help(const char *name)
 #else /* defined(FEATURE_ELF) */
 	       "You must specify at least one binary file (--raw).\n"
 #endif /* defined(FEATURE_ELF) */
+#if defined(FEATURE_PEVENT)
+	       "You may specify one or more perf_event sideband files (--pevent:primary or\n"
+	       "--pevent:secondary).\n"
+	       "Use --pevent: options to change the perf_event configuration for the next\n"
+	       "perf_event sideband file.\n"
+#endif /* defined(FEATURE_PEVENT) */
 	       "You must specify exactly one processor trace file (--pt).\n",
 	       name);
 }
@@ -319,6 +444,63 @@ static int load_raw(struct pt_image *image, char *arg, const char *prog)
 
 	return 0;
 }
+
+#if defined(FEATURE_PEVENT)
+
+static struct ptxed_obsv *
+ptxed_obsv_pevent(const struct ptxed_pevent_config *conf, char *filename,
+		  int primary, const char *prog)
+{
+	struct ptxed_pevent_config config;
+	struct pt_observer *obsv;
+	struct ptxed_obsv *list;
+	uint8_t *buffer;
+	size_t size;
+	int errcode;
+
+	if (!conf || !prog) {
+		fprintf(stderr, "%s: internal error.\n", prog ? prog : "");
+		return NULL;
+	}
+
+	config = *conf;
+
+	if (!(config.pev.sample_type & PERF_SAMPLE_TIME)) {
+		fprintf(stderr, "%s: no time samples.\n", prog);
+		return NULL;
+	}
+
+	errcode = load_file(&buffer, &size, filename, prog);
+	if (errcode < 0)
+		return NULL;
+
+	config.begin = buffer;
+	config.end = buffer + size;
+
+	obsv = ptxed_obsv_pevent_alloc(&config);
+	if (!obsv) {
+		fprintf(stderr, "%s: failed to allocate sideband decoder\n",
+			prog);
+		goto err_file;
+	}
+
+	list = ptxed_obsv_alloc(obsv, NULL,
+				primary ? ptxed_obsv_pevent_set_decoder : NULL,
+				ptxed_obsv_pevent_free);
+	if (!list)
+		goto err_obsv;
+
+	return list;
+
+err_obsv:
+	ptxed_obsv_pevent_free(obsv);
+
+err_file:
+	free(buffer);
+	return NULL;
+}
+
+#endif /* defined(FEATURE_PEVENT) */
 
 static xed_machine_mode_enum_t translate_mode(enum pt_exec_mode mode)
 {
@@ -603,6 +785,29 @@ static int get_arg_uint32(uint32_t *value, const char *option, const char *arg,
 	return 1;
 }
 
+#if defined(FEATURE_PEVENT)
+
+static int get_arg_uint16(uint16_t *value, const char *option, const char *arg,
+			  const char *prog)
+{
+	uint64_t val;
+
+	if (!get_arg_uint64(&val, option, arg, prog))
+		return 0;
+
+	if (val > UINT16_MAX) {
+		fprintf(stderr, "%s: %s: value too big: %s.\n", prog, option,
+			arg);
+		return 0;
+	}
+
+	*value = (uint16_t) val;
+
+	return 1;
+}
+
+#endif /* defined(FEATURE_PEVENT) */
+
 static int get_arg_uint8(uint8_t *value, const char *option, const char *arg,
 			 const char *prog)
 {
@@ -624,9 +829,13 @@ static int get_arg_uint8(uint8_t *value, const char *option, const char *arg,
 
 extern int main(int argc, char *argv[])
 {
+#if defined(FEATURE_PEVENT)
+	struct ptxed_pevent_config pevent;
+#endif /* defined(FEATURE_PEVENT) */
 	struct pt_insn_decoder *decoder;
 	struct ptxed_options options;
 	struct ptxed_stats stats;
+	struct ptxed_obsv *obsv;
 	struct pt_config config;
 	struct pt_image *image;
 	const char *prog;
@@ -639,6 +848,7 @@ extern int main(int argc, char *argv[])
 
 	prog = argv[0];
 	decoder = NULL;
+	obsv = NULL;
 
 	memset(&options, 0, sizeof(options));
 	memset(&stats, 0, sizeof(stats));
@@ -650,6 +860,13 @@ extern int main(int argc, char *argv[])
 		fprintf(stderr, "%s: failed to allocate image.\n", prog);
 		return 1;
 	}
+
+#if defined(FEATURE_PEVENT)
+	memset(&pevent, 0, sizeof(pevent));
+	pevent.pev.size = sizeof(pevent);
+	pevent.pev.time_mult = 1;
+	pevent.kernel_start = (1ull << 63);
+#endif /* defined(FEATURE_PEVENT) */
 
 	for (i = 1; i < argc;) {
 		char *arg;
@@ -746,6 +963,175 @@ extern int main(int argc, char *argv[])
 			options.att_format = 1;
 			continue;
 		}
+#if defined(FEATURE_PEVENT)
+		if (strcmp(arg, "--pevent:primary") == 0) {
+			struct ptxed_obsv *pev_obsv;
+			char *arg;
+
+			arg = argv[i++];
+			if (!arg) {
+				fprintf(stderr, "%s: --pevent:primary: "
+					"missing argument.\n", prog);
+				goto err;
+			}
+
+			pev_obsv = ptxed_obsv_pevent(&pevent, arg,
+						     /* primary = */ 1, prog);
+			if (!pev_obsv)
+				goto err;
+
+			/* Add the observer - we will attach it later. */
+			pev_obsv->next = obsv;
+			obsv = pev_obsv;
+
+			options.pevent_have_primary = 1;
+			continue;
+		}
+		if (strcmp(arg, "--pevent:secondary") == 0) {
+			struct ptxed_obsv *pev_obsv;
+			char *arg;
+
+			arg = argv[i++];
+			if (!arg) {
+				fprintf(stderr, "%s: --pevent:secondary: "
+					"missing argument.\n", prog);
+				goto err;
+			}
+
+			pev_obsv = ptxed_obsv_pevent(&pevent, arg,
+						     /* primary = */ 0, prog);
+			if (!pev_obsv)
+				goto err;
+
+			/* Add the observer - we will attach it later. */
+			pev_obsv->next = obsv;
+			obsv = pev_obsv;
+
+			continue;
+		}
+		if (strcmp(arg, "--pevent:sample-type") == 0) {
+			if (!get_arg_uint64(&pevent.pev.sample_type,
+					    "--pevent:sample-type",
+					    argv[i++], prog))
+				goto err;
+
+			continue;
+		}
+		if (strcmp(arg, "--pevent:time-zero") == 0) {
+			if (!get_arg_uint64(&pevent.pev.time_zero,
+					    "--pevent:time-zero",
+					    argv[i++], prog))
+				goto err;
+
+			continue;
+		}
+		if (strcmp(arg, "--pevent:time-shift") == 0) {
+			if (!get_arg_uint16(&pevent.pev.time_shift,
+					    "--pevent:time-shift",
+					    argv[i++], prog))
+				goto err;
+
+			continue;
+		}
+		if (strcmp(arg, "--pevent:time-mult") == 0) {
+			if (!get_arg_uint32(&pevent.pev.time_mult,
+					    "--pevent:time-mult",
+					    argv[i++], prog))
+				goto err;
+
+			continue;
+		}
+		if (strcmp(arg, "--pevent:tsc-offset") == 0) {
+			if (!get_arg_uint64(&pevent.tsc_offset,
+					    "--pevent:tsc-offset",
+					    argv[i++], prog))
+				goto err;
+
+			continue;
+		}
+		if (strcmp(arg, "--pevent:kernel-start") == 0) {
+			if (!get_arg_uint64(&pevent.kernel_start,
+					    "--pevent:kernel-start",
+					    argv[i++], prog))
+				goto err;
+
+			continue;
+		}
+		if (strcmp(arg, "--pevent:vdso") == 0) {
+			char *arg;
+
+			arg = argv[i++];
+			if (!arg) {
+				fprintf(stderr,
+					"%s: --pevent:vdso: missing argument.\n",
+					prog);
+				goto err;
+			}
+
+			pevent.vdso = arg;
+			continue;
+		}
+		if (strcmp(arg, "--pevent:sysroot") == 0) {
+			char *arg;
+
+			arg = argv[i++];
+			if (!arg) {
+				fprintf(stderr, "%s: --pevent:sysroot: "
+					"missing argument.\n", prog);
+				goto err;
+			}
+
+			pevent.sysroot = arg;
+			continue;
+		}
+		if (strcmp(arg, "--pevent:ring-0") == 0) {
+			if (options.pevent_have_primary) {
+				fprintf(stderr,	"%s: please specify --pevent:"
+					"ring-0 before --pevent:primary.\n",
+					prog);
+				goto err;
+			}
+
+			pevent.ring_0 = 1;
+			continue;
+		}
+		if (strcmp(arg, "--pevent:ring-3") == 0) {
+			pevent.ring_3 = 1;
+			continue;
+		}
+		if (strcmp(arg, "--pevent:flags") == 0) {
+			if (!get_arg_uint32(&pevent.flags,
+					    "--pevent:flags",
+					    argv[i++], prog))
+				goto err;
+
+			continue;
+		}
+#  if defined(FEATURE_ELF)
+		if (strcmp(arg, "--pevent:kcore") == 0) {
+			uint64_t base;
+
+			if (argc <= i) {
+				fprintf(stderr, "%s: --pevent:kcore: "
+					"missing argument.\n", prog);
+				goto out;
+			}
+			arg = argv[i++];
+			base = 0ull;
+			errcode = extract_base(arg, &base, prog);
+			if (errcode < 0)
+				goto err;
+
+			errcode = ptxed_obsv_pevent_kcore(arg, base, prog,
+							  options.track_image);
+			if (errcode < 0)
+				goto err;
+
+			options.pevent_have_kcore = 1;
+			continue;
+		}
+#  endif /* defined(FEATURE_ELF) */
+#endif /* defined(FEATURE_PEVENT) */
 		if (strcmp(arg, "--no-inst") == 0) {
 			options.dont_print_insn = 1;
 			continue;
@@ -853,6 +1239,16 @@ extern int main(int argc, char *argv[])
 		goto err;
 	}
 
+#if defined(FEATURE_PEVENT)
+	if (pevent.ring_0 && !options.pevent_have_kcore)
+		fprintf(stderr, "%s: warning: ring-0 decode without "
+			"--pevent:kcore.\n", prog);
+#endif /* defined(FEATURE_PEVENT) */
+
+	errcode = ptxed_obsv_attach(obsv, decoder, prog);
+	if (errcode < 0)
+		goto err;
+
 	xed_tables_init();
 	decode(decoder, &options, &stats);
 
@@ -861,11 +1257,13 @@ extern int main(int argc, char *argv[])
 
 out:
 	pt_insn_free_decoder(decoder);
+	ptxed_obsv_free(obsv);
 	pt_image_free(image);
 	return 0;
 
 err:
 	pt_insn_free_decoder(decoder);
+	ptxed_obsv_free(obsv);
 	pt_image_free(image);
 	return 1;
 }
