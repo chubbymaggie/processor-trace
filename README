@@ -39,6 +39,7 @@ Optional Contents and Samples
                 A document describing how to get started
                 A document describing the usage of the decoder library
                 A document describing pttc
+                A document describing how to capture trace
 
   doc/man       Man pages for the encoder/decoder library
 
