@@ -32,7 +32,6 @@
 #include "pt_query_decoder.h"
 #include "pt_image.h"
 #include "pt_retstack.h"
-#include "pt_ild.h"
 
 #include <inttypes.h>
 
@@ -40,6 +39,13 @@
 struct pt_insn_decoder {
 	/* The Intel(R) Processor Trace query decoder. */
 	struct pt_query_decoder query;
+
+	/* The configuration flags.
+	 *
+	 * Those are our flags set by the user.  In @query.config.flags, we set
+	 * the flags we need for the query decoder.
+	 */
+	struct pt_conf_flags flags;
 
 	/* The default image. */
 	struct pt_image default_image;
@@ -55,9 +61,6 @@ struct pt_insn_decoder {
 
 	/* The call/return stack for ret compression. */
 	struct pt_retstack retstack;
-
-	/* The Intel(R) Processor Trace instruction (length) decoder. */
-	struct pt_ild ild;
 
 	/* The current IP. */
 	uint64_t ip;

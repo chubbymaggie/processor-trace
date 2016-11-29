@@ -27,6 +27,7 @@
  */
 
 #include "pt_section.h"
+#include "pt_block_cache.h"
 
 #include "intel-pt.h"
 
@@ -100,6 +101,33 @@ struct pt_section *pt_mk_section(const char *filename, uint64_t offset,
 out_status:
 	free(status);
 	return NULL;
+}
+
+int pt_section_clone(struct pt_section **pclone,
+		     const struct pt_section *section, uint64_t offset,
+		     uint64_t size)
+{
+	struct pt_section *clone;
+	uint64_t begin, end, sbegin, send;
+
+	if (!pclone || !section)
+		return -pte_internal;
+
+	begin = offset;
+	end = begin + size;
+
+	sbegin = pt_section_offset(section);
+	send = sbegin + pt_section_size(section);
+
+	if (begin < sbegin || send < end)
+		return -pte_internal;
+
+	clone = pt_mk_section(pt_section_filename(section), offset, size);
+	if (!clone)
+		return -pte_nomem;
+
+	*pclone = clone;
+	return 0;
 }
 
 int pt_section_lock(struct pt_section *section)
@@ -223,6 +251,37 @@ uint64_t pt_section_size(const struct pt_section *section)
 	return section->size;
 }
 
+uint64_t pt_section_offset(const struct pt_section *section)
+{
+	if (!section)
+		return 0ull;
+
+	return section->offset;
+}
+
+int pt_section_add_bcache(struct pt_section *section)
+{
+	uint32_t cache_size;
+
+	if (!section || section->bcache)
+		return -pte_internal;
+
+	if (section->disable_bcache)
+		return 0;
+
+	cache_size = (uint32_t) section->size;
+
+	/* We do not allocate a cache if it would get too big.
+	 *
+	 * We also do not treat failure to allocate a cache as an error.
+	 * Without the cache, decode will be slower but still correct.
+	 */
+	if (cache_size == section->size)
+		section->bcache = pt_bcache_alloc(cache_size);
+
+	return 0;
+}
+
 int pt_section_unmap(struct pt_section *section)
 {
 	uint16_t mcount;
@@ -250,6 +309,9 @@ int pt_section_unmap(struct pt_section *section)
 		goto out_unlock;
 
 	status = section->unmap(section);
+
+	pt_bcache_free(section->bcache);
+	section->bcache = NULL;
 
 	errcode = pt_section_unlock(section);
 	if (errcode < 0)

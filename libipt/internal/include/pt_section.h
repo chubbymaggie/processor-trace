@@ -30,10 +30,13 @@
 #define PT_SECTION_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #if defined(FEATURE_THREADS)
 #  include <threads.h>
 #endif /* defined(FEATURE_THREADS) */
+
+struct pt_block_cache;
 
 
 /* A section of contiguous memory loaded from a file. */
@@ -64,6 +67,13 @@ struct pt_section {
 	 * implementation.
 	 */
 	void *mapping;
+
+	/* A pointer to an optional block cache.
+	 *
+	 * The cache is created and destroyed implicitly when the section is
+	 * mapped and unmapped respectively.
+	 */
+	struct pt_block_cache *bcache;
 
 	/* A pointer to the unmap function - NULL if the section is currently
 	 * not mapped.
@@ -96,6 +106,12 @@ struct pt_section {
 
 	/* The number of current mappers.  The last unmaps the section. */
 	uint16_t mcount;
+
+	/* A collection of flags to:
+	 *
+	 * - disable block caching.
+	 */
+	uint32_t disable_bcache:1;
 };
 
 /* Create a section.
@@ -108,12 +124,28 @@ struct pt_section {
  *
  * If @offset lies beyond the end of @file, no section is created.
  *
- * The returned section is not mapped and starts with a user count of one.
+ * The returned section is not mapped and starts with a user count of one and
+ * instruction caching enabled.
  *
  * Returns a new section on success, NULL otherwise.
  */
 extern struct pt_section *pt_mk_section(const char *file, uint64_t offset,
 					uint64_t size);
+
+/* Clone (parts of) a section.
+ *
+ * The cloned section describes the same content as @section but starting at
+ * @offset for @size bytes.  The cloned range must lie within @section.
+ *
+ * The cloned section is not mapped and starts with a user count of one.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ * Returns -pte_internal if @clone or @section is NULL.
+ * Returns -pte_internal if the cloned range lies outside of @section.
+ */
+extern int pt_section_clone(struct pt_section **clone,
+			    const struct pt_section *section, uint64_t offset,
+			    uint64_t size);
 
 /* Lock a section.
  *
@@ -159,8 +191,42 @@ extern int pt_section_put(struct pt_section *section);
 /* Return the filename of @section. */
 extern const char *pt_section_filename(const struct pt_section *section);
 
+/* Return the offset of the section in bytes. */
+extern uint64_t pt_section_offset(const struct pt_section *section);
+
 /* Return the size of the section in bytes. */
 extern uint64_t pt_section_size(const struct pt_section *section);
+
+/* Return @section's block cache, if available.
+ *
+ * @section must be mapped.
+ *
+ * The cache, if available, is implicitly created when the section is mapped and
+ * implicitly destroyed when the section is unmapped.
+ *
+ * The cache is not use-counted.  It is only valid as long as the caller keeps
+ * @section mapped.
+ */
+static inline struct pt_block_cache *
+pt_section_bcache(const struct pt_section *section)
+{
+	if (!section)
+		return NULL;
+
+	return section->bcache;
+}
+
+/* Enable block caching. */
+static inline void pt_section_enable_bcache(struct pt_section *section)
+{
+	section->disable_bcache = 0;
+}
+
+/* Disable block caching. */
+static inline void pt_section_disable_bcache(struct pt_section *section)
+{
+	section->disable_bcache = 1;
+}
 
 /* Create the OS-specific file status.
  *
@@ -178,6 +244,17 @@ extern uint64_t pt_section_size(const struct pt_section *section);
  */
 extern int pt_section_mk_status(void **pstatus, uint64_t *psize,
 				const char *filename);
+
+/* Setup a block cache.
+ *
+ * This function is called from the OS-specific implementation when the section
+ * is mapped.  Do not call this function directly.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ * Returns -pte_internal if @section is NULL.
+ * Returns -pte_internal if @section already has an instruction cache.
+ */
+extern int pt_section_add_bcache(struct pt_section *section);
 
 /* Map a section.
  *
@@ -212,7 +289,7 @@ extern int pt_section_unmap(struct pt_section *section);
  * must be mapped.
  *
  * Returns the number of bytes read on success, a negative error code otherwise.
- * Returns -pte_invalid if @section or @buffer are NULL.
+ * Returns -pte_internal if @section or @buffer are NULL.
  * Returns -pte_nomap if @offset is beyond the end of the section.
  */
 extern int pt_section_read(const struct pt_section *section, uint8_t *buffer,

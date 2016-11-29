@@ -30,8 +30,9 @@
 
 # NAME
 
-pt_enc_get_config, pt_pkt_get_config, pt_qry_get_config, pt_insn_get_config -
-get an Intel(R) Processor Trace encoder/decoder's configuration
+pt_enc_get_config, pt_pkt_get_config, pt_qry_get_config, pt_insn_get_config,
+pt_blk_get_config - get an Intel(R) Processor Trace encoder/decoder's
+configuration
 
 
 # SYNOPSIS
@@ -49,6 +50,9 @@ get an Intel(R) Processor Trace encoder/decoder's configuration
 |
 | **const struct pt_config \***
 | **pt_insn_get_config(const struct pt_insn_decoder \**decoder*);**
+|
+| **const struct pt_config \***
+| **pt_blk_get_config(const struct pt_block_decoder \**decoder*);**
 
 Link with *-lipt*.
 
@@ -69,4 +73,5 @@ is NULL if their argument is NULL.
 # SEE ALSO
 
 **pt_config**(3), **pt_alloc_encoder**(3), **pt_pkt_alloc_decoder**(3),
-**pt_qry_alloc_decoder**(3), **pt_insn_alloc_decoder**(3)
+**pt_qry_alloc_decoder**(3), **pt_insn_alloc_decoder**(3),
+**pt_blk_alloc_decoder**(3)

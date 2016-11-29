@@ -29,17 +29,6 @@
 # This script executes ptt tests and compares the output of tools, like
 # ptxed or ptdump, with the expected output from the ptt testfile.
 
-check_tools() {
-	local status=0
-	for i in "$@"; do
-		if [[ -z "`which $i`" ]]; then
-			echo "$i: not in PATH" >&2
-			status=1
-		fi
-	done
-	return $status
-}
-
 info() {
 	[[ $verbose != 0 ]] && echo -e "$@" >&2
 }
@@ -120,9 +109,6 @@ if [[ $# == 0 ]]; then
 	exit 1
 fi
 
-# check if all the tools are in PATH
-check_tools $pttc_cmd yasm $ptxed_cmd $ptdump_cmd || exit 1
-
 # the exit status
 status=0
 
@@ -182,7 +168,7 @@ run-ptt-test() {
 				continue
 			fi
 			local opts=`ptt-ptxed-opts $ptt`
-			run $ptxed_cmd $cpu $opts --pt $pt --raw $bin:$addr --no-inst > $out
+			run $ptxed_cmd --raw $bin:$addr $cpu $opts --pt $pt --no-inst > $out
 			;;
 		ptdump)
 			local opts=`ptt-ptdump-opts $ptt`

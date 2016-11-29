@@ -44,6 +44,9 @@ struct pt_section_list {
 	/* The mapped section. */
 	struct pt_mapped_section section;
 
+	/* The image section identifier. */
+	int isid;
+
 	/* A flag saying whether @section is already mapped. */
 	uint32_t mapped:1;
 };
@@ -83,14 +86,16 @@ extern void pt_image_fini(struct pt_image *image);
 
 /* Add a section to an image.
  *
- * Add @section to @image at @vaddr in @asid if @section fits without overlap.
+ * Add @section identified by @isid to @image at @vaddr in @asid.  If @section
+ * overlaps with existing sections, the existing sections are shrunk, split, or
+ * removed to accomodate @section.  Absence of a section identifier is indicated
+ * by an @isid of zero.
  *
  * Returns zero on success.
  * Returns -pte_internal if @image, @section, or @asid is NULL.
- * Returns -pte_bad_image if @section overlaps with a section in @image.
  */
 extern int pt_image_add(struct pt_image *image, struct pt_section *section,
-			const struct pt_asid *asid, uint64_t vaddr);
+			const struct pt_asid *asid, uint64_t vaddr, int isid);
 
 /* Remove a section from an image.
  *
@@ -106,11 +111,42 @@ extern int pt_image_remove(struct pt_image *image, struct pt_section *section,
  * Reads at most @size bytes from @image at @addr in @asid into @buffer.
  *
  * Returns the number of bytes read on success, a negative error code otherwise.
- * Returns -pte_internal if @image, @buffer, or @asid is NULL.
+ * Returns -pte_internal if @image, @isid, @buffer, or @asid is NULL.
  * Returns -pte_nomap if the section does not contain @addr.
  */
-extern int pt_image_read(struct pt_image *image, uint8_t *buffer,
+extern int pt_image_read(struct pt_image *image, int *isid, uint8_t *buffer,
 			 uint16_t size, const struct pt_asid *asid,
 			 uint64_t addr);
+
+/* Find an image section.
+ *
+ * Find the section containing @vaddr in @asid and provide a reference to it in
+ * @section and its load address in @laddr.  The caller needs to put the
+ * reference to @section after use.
+ *
+ * Returns the section's identifier on success, a negative error code otherwise.
+ * Returns -pte_internal if @image, @section, @laddr, or @asid is NULL.
+ * Returns -pte_nomap if there is no such section in @image.
+ */
+extern int pt_image_find(struct pt_image *image, struct pt_section **section,
+			 uint64_t *laddr, const struct pt_asid *asid,
+			 uint64_t vaddr);
+
+/* Validate an image section.
+ *
+ * Validate that a lookup by @asid and @vaddr in @image would result in @section
+ * loaded at @laddr identified by @isid.
+ *
+ * Validation may fail sporadically, e.g. if @section has been evicted from
+ * @image's LRU cache.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ * Returns -pte_invalid if @image or @asid is NULL.
+ * Returns -pte_nomap if validation failed.
+ */
+extern int pt_image_validate(const struct pt_image *image,
+			     const struct pt_asid *asid, uint64_t vaddr,
+			     const struct pt_section *section, uint64_t laddr,
+			     int isid);
 
 #endif /* PT_IMAGE_H */

@@ -38,6 +38,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <limits.h>
 
 
 struct ptdump_options {
@@ -169,38 +170,35 @@ static int unknown_option_error(const char *arg, const char *name)
 
 static int help(const char *name)
 {
-	fprintf(stderr,
-		"usage: %s [<options>] <ptfile>[:<from>[-<to>]\n\n"
-		"options:\n"
-		"  --help|-h                 this text.\n"
-		"  --version                 display version information and exit.\n"
-		"  --no-sync                 don't try to sync to the first PSB, assume a valid\n"
-		"                            sync point at the beginning of the trace.\n"
-		"  --quiet                   don't print anything but errors.\n"
-		"  --no-pad                  don't show PAD packets.\n"
-		"  --no-timing               don't show timing packets.\n"
-		"  --no-cyc                  don't show CYC packets and ignore them when tracking time.\n"
-		"  --no-offset               don't show the offset as the first column.\n"
-		"  --raw                     show raw packet bytes.\n"
-		"  --lastip                  show last IP updates on packets with IP payloads.\n"
-		"  --exec-mode               show the current execution mode on mode.exec packets.\n"
-		"  --time                    show the estimated TSC on timing packets.\n"
-		"  --tcal                    show time calibration information.\n"
-		"  --time-delta              show timing information as delta.\n"
-		"  --no-tcal                 skip timing calibration.\n"
-		"                            this will result in errors when CYC packets are encountered.\n"
-		"  --no-wall-clock           suppress the no-time error and print relative time.\n"
-		"  --cpu none|auto|f/m[/s]   set cpu to the given value and decode according to:\n"
-		"                              none     spec (default)\n"
-		"                              auto     current cpu\n"
-		"                              f/m[/s]  family/model[/stepping]\n"
-		"  --mtc-freq <n>            set the MTC frequency (IA32_RTIT_CTL[17:14]) to <n>.\n"
-		"  --nom-freq <n>            set the nominal frequency (MSR_PLATFORM_INFO[15:8]) to <n>.\n"
-		"  --cpuid-0x15.eax          set the value of cpuid[0x15].eax.\n"
-		"  --cpuid-0x15.ebx          set the value of cpuid[0x15].ebx.\n"
-		"  <ptfile>[:<from>[-<to>]]  load the processor trace data from <ptfile>;\n"
-		"                            an optional offset or range can be given.\n",
-		name);
+	printf("usage: %s [<options>] <ptfile>[:<from>[-<to>]\n\n", name);
+	printf("options:\n");
+	printf("  --help|-h                 this text.\n");
+	printf("  --version                 display version information and exit.\n");
+	printf("  --no-sync                 don't try to sync to the first PSB, assume a valid\n");
+	printf("                            sync point at the beginning of the trace.\n");
+	printf("  --quiet                   don't print anything but errors.\n");
+	printf("  --no-pad                  don't show PAD packets.\n");
+	printf("  --no-timing               don't show timing packets.\n");
+	printf("  --no-cyc                  don't show CYC packets and ignore them when tracking time.\n");
+	printf("  --no-offset               don't show the offset as the first column.\n");
+	printf("  --raw                     show raw packet bytes.\n");
+	printf("  --lastip                  show last IP updates on packets with IP payloads.\n");
+	printf("  --exec-mode               show the current execution mode on mode.exec packets.\n");
+	printf("  --time                    show the estimated TSC on timing packets.\n");
+	printf("  --tcal                    show time calibration information.\n");
+	printf("  --time-delta              show timing information as delta.\n");
+	printf("  --no-tcal                 skip timing calibration.\n");
+	printf("                            this will result in errors when CYC packets are encountered.\n");
+	printf("  --no-wall-clock           suppress the no-time error and print relative time.\n");
+	printf("  --cpu none|auto|f/m[/s]   set cpu to the given value and decode according to:\n");
+	printf("                              none     spec (default)\n");
+	printf("                              auto     current cpu\n");
+	printf("                              f/m[/s]  family/model[/stepping]\n");
+	printf("  --mtc-freq <n>            set the MTC frequency (IA32_RTIT_CTL[17:14]) to <n>.\n");
+	printf("  --nom-freq <n>            set the nominal frequency (MSR_PLATFORM_INFO[15:8]) to <n>.\n");
+	printf("  --cpuid-0x15.eax          set the value of cpuid[0x15].eax.\n");
+	printf("  --cpuid-0x15.ebx          set the value of cpuid[0x15].ebx.\n");
+	printf("  <ptfile>[:<from>[-<to>]]  load the processor trace data from <ptfile>;\n");
 
 	return 0;
 }
@@ -240,94 +238,130 @@ static int parse_range(const char *arg, uint64_t *begin, uint64_t *end)
 	return 2;
 }
 
-static int load_file(uint8_t **buffer, size_t *size, char *arg,
-		     const char *prog)
+/* Preprocess a filename argument.
+ *
+ * A filename may optionally be followed by a file offset or a file range
+ * argument separated by ':'.  Split the original argument into the filename
+ * part and the offset/range part.
+ *
+ * If no end address is specified, set @size to zero.
+ * If no offset is specified, set @offset to zero.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ */
+static int preprocess_filename(char *filename, uint64_t *offset, uint64_t *size)
 {
-	uint64_t begin_arg, end_arg;
+	uint64_t begin, end;
+	char *range;
+	int parts;
+
+	if (!filename || !offset || !size)
+		return -pte_internal;
+
+	/* Search from the end as the filename may also contain ':'. */
+	range = strrchr(filename, ':');
+	if (!range) {
+		*offset = 0ull;
+		*size = 0ull;
+
+		return 0;
+	}
+
+	/* Let's try to parse an optional range suffix.
+	 *
+	 * If we can, remove it from the filename argument.
+	 * If we can not, assume that the ':' is part of the filename, e.g. a
+	 * drive letter on Windows.
+	 */
+	parts = parse_range(range + 1, &begin, &end);
+	if (parts <= 0) {
+		*offset = 0ull;
+		*size = 0ull;
+
+		return 0;
+	}
+
+	if (parts == 1) {
+		*offset = begin;
+		*size = 0ull;
+
+		*range = 0;
+
+		return 0;
+	}
+
+	if (parts == 2) {
+		if (end <= begin)
+			return -pte_invalid;
+
+		*offset = begin;
+		*size = end - begin;
+
+		*range = 0;
+
+		return 0;
+	}
+
+	return -pte_internal;
+}
+
+static int load_file(uint8_t **buffer, size_t *psize, const char *filename,
+		     uint64_t offset, uint64_t size, const char *prog)
+{
 	uint8_t *content;
 	size_t read;
 	FILE *file;
 	long fsize, begin, end;
-	int errcode, range_parts;
-	char *range;
+	int errcode;
 
-	if (!buffer || !size || !arg || !prog) {
+	if (!buffer || !psize || !filename || !prog) {
 		fprintf(stderr, "%s: internal error.\n", prog ? prog : "");
 		return -1;
 	}
 
-	range_parts = 0;
-	begin_arg = 0ull;
-	end_arg = UINT64_MAX;
-
-	range = strrchr(arg, ':');
-	if (range) {
-		/* Let's try to parse an optional range suffix.
-		 *
-		 * If we can, remove it from the filename argument.
-		 * If we can not, assume that the ':' is part of the filename,
-		 * e.g. a drive letter on Windows.
-		 */
-		range_parts = parse_range(range + 1, &begin_arg, &end_arg);
-		if (range_parts <= 0) {
-			begin_arg = 0ull;
-			end_arg = UINT64_MAX;
-
-			range_parts = 0;
-		} else
-			*range = 0;
-	}
-
 	errno = 0;
-	file = fopen(arg, "rb");
+	file = fopen(filename, "rb");
 	if (!file) {
 		fprintf(stderr, "%s: failed to open %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		return -1;
 	}
 
 	errcode = fseek(file, 0, SEEK_END);
 	if (errcode) {
 		fprintf(stderr, "%s: failed to determine size of %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_file;
 	}
 
 	fsize = ftell(file);
 	if (fsize < 0) {
 		fprintf(stderr, "%s: failed to determine size of %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_file;
 	}
 
-	/* Truncate the range to fit into the file unless an explicit range end
-	 * was provided.
-	 */
-	if (range_parts < 2)
-		end_arg = (uint64_t) fsize;
-
-	begin = (long) begin_arg;
-	end = (long) end_arg;
-	if ((uint64_t) begin != begin_arg || (uint64_t) end != end_arg) {
-		fprintf(stderr, "%s: invalid offset/range argument.\n", prog);
+	begin = (long) offset;
+	if (((uint64_t) begin != offset) || (fsize <= begin)) {
+		fprintf(stderr,
+			"%s: bad offset 0x%" PRIx64 " into %s.\n",
+			prog, offset, filename);
 		goto err_file;
 	}
 
-	if (fsize <= begin) {
-		fprintf(stderr, "%s: offset 0x%lx outside of %s.\n",
-			prog, begin, arg);
-		goto err_file;
-	}
+	end = fsize;
+	if (size) {
+		uint64_t range_end;
 
-	if (fsize < end) {
-		fprintf(stderr, "%s: range 0x%lx outside of %s.\n",
-			prog, end, arg);
-		goto err_file;
-	}
+		range_end = offset + size;
+		if ((uint64_t) end < range_end) {
+			fprintf(stderr,
+				"%s: bad range 0x%" PRIx64 " in %s.\n",
+				prog, range_end, filename);
+			goto err_file;
+		}
 
-	if (end <= begin) {
-		fprintf(stderr, "%s: bad range.\n", prog);
-		goto err_file;
+		end = (long) range_end;
 	}
 
 	fsize = end - begin;
@@ -335,28 +369,28 @@ static int load_file(uint8_t **buffer, size_t *size, char *arg,
 	content = malloc(fsize);
 	if (!content) {
 		fprintf(stderr, "%s: failed to allocated memory %s.\n",
-			prog, arg);
+			prog, filename);
 		goto err_file;
 	}
 
 	errcode = fseek(file, begin, SEEK_SET);
 	if (errcode) {
 		fprintf(stderr, "%s: failed to load %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_content;
 	}
 
 	read = fread(content, fsize, 1, file);
 	if (read != 1) {
 		fprintf(stderr, "%s: failed to load %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_content;
 	}
 
 	fclose(file);
 
 	*buffer = content;
-	*size = fsize;
+	*psize = fsize;
 
 	return 0;
 
@@ -368,13 +402,14 @@ err_file:
 	return -1;
 }
 
-static int load_pt(struct pt_config *config, char *arg, const char *prog)
+static int load_pt(struct pt_config *config, const char *filename,
+		   uint64_t foffset, uint64_t fsize, const char *prog)
 {
 	uint8_t *buffer;
 	size_t size;
 	int errcode;
 
-	errcode = load_file(&buffer, &size, arg, prog);
+	errcode = load_file(&buffer, &size, filename, foffset, fsize, prog);
 	if (errcode < 0)
 		return errcode;
 
@@ -1337,6 +1372,7 @@ int main(int argc, char *argv[])
 	struct pt_config config;
 	int errcode, idx;
 	char *ptfile;
+	uint64_t pt_offset, pt_size;
 
 	ptfile = NULL;
 
@@ -1462,13 +1498,20 @@ int main(int argc, char *argv[])
 	if (!ptfile)
 		return no_file_error(argv[0]);
 
+	errcode = preprocess_filename(ptfile, &pt_offset, &pt_size);
+	if (errcode < 0) {
+		fprintf(stderr, "%s: bad file %s: %s.\n", argv[0], ptfile,
+			pt_errstr(pt_errcode(errcode)));
+		return 1;
+	}
+
 	errcode = pt_cpu_errata(&config.errata, &config.cpu);
 	if (errcode < 0)
 		diag("failed to determine errata", 0ull, errcode);
 
-	errcode = load_pt(&config, ptfile, argv[0]);
+	errcode = load_pt(&config, ptfile, pt_offset, pt_size, argv[0]);
 	if (errcode < 0)
-		return errcode;
+		return 1;
 
 	errcode = dump(&config, &options);
 

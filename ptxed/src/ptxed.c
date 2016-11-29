@@ -40,13 +40,29 @@
 #include <inttypes.h>
 #include <errno.h>
 
-#include <xed-state.h>
-#include <xed-init.h>
-#include <xed-error-enum.h>
-#include <xed-decode.h>
-#include <xed-decoded-inst-api.h>
-#include <xed-machine-mode-enum.h>
+#include <xed-interface.h>
 
+
+/* The type of decoder to be used. */
+enum ptxed_decoder_type {
+	pdt_insn_decoder,
+	pdt_block_decoder
+};
+
+/* The decoder to use. */
+struct ptxed_decoder {
+	/* The decoder type. */
+	enum ptxed_decoder_type type;
+
+	/* The actual decoder. */
+	union {
+		/* If @type == pdt_insn_decoder */
+		struct pt_insn_decoder *insn;
+
+		/* If @type == pdt_block_decoder */
+		struct pt_block_decoder *block;
+	} variant;
+};
 
 /* A collection of options. */
 struct ptxed_options {
@@ -62,6 +78,12 @@ struct ptxed_options {
 	/* Print information about section loads and unloads. */
 	uint32_t track_image:1;
 
+	/* Track blocks in the output.
+	 *
+	 * This only applies to the block decoder.
+	 */
+	uint32_t track_blocks:1;
+
 	/* Print in AT&T format. */
 	uint32_t att_format:1;
 
@@ -72,12 +94,51 @@ struct ptxed_options {
 	uint32_t print_raw_insn:1;
 };
 
+/* A collection of flags selecting which stats to collect/print. */
+enum ptxed_stats_flag {
+	/* Collect number of instructions. */
+	ptxed_stat_insn		= (1 << 0),
+
+	/* Collect number of blocks. */
+	ptxed_stat_blocks	= (1 << 1)
+};
+
 /* A collection of statistics. */
 struct ptxed_stats {
 	/* The number of instructions. */
 	uint64_t insn;
+
+	/* The number of blocks.
+	 *
+	 * This only applies to the block decoder.
+	 */
+	uint64_t blocks;
+
+	/* A collection of flags saying which statistics to collect/print. */
+	uint32_t flags;
 };
 
+static int ptxed_have_decoder(const struct ptxed_decoder *decoder)
+{
+	/* It suffices to check for one decoder in the variant union. */
+	return decoder && decoder->variant.insn;
+}
+
+static void ptxed_free_decoder(struct ptxed_decoder *decoder)
+{
+	if (!decoder)
+		return;
+
+	switch (decoder->type) {
+	case pdt_insn_decoder:
+		pt_insn_free_decoder(decoder->variant.insn);
+		break;
+
+	case pdt_block_decoder:
+		pt_blk_free_decoder(decoder->variant.block);
+		break;
+	}
+}
 
 static void version(const char *name)
 {
@@ -90,40 +151,46 @@ static void version(const char *name)
 
 static void help(const char *name)
 {
-	printf("usage: %s [<options>]\n\n"
-	       "options:\n"
-	       "  --help|-h                     this text.\n"
-	       "  --version                     display version information and exit.\n"
-	       "  --att                         print instructions in att format.\n"
-	       "  --no-inst                     do not print instructions (only addresses).\n"
-	       "  --quiet|-q                    do not print anything (except errors).\n"
-	       "  --offset                      print the offset into the trace file.\n"
-	       "  --raw-insn                    print the raw bytes of each instruction.\n"
-	       "  --stat                        print statistics (even when quiet).\n"
-	       "  --verbose|-v                  print various information (even when quiet).\n"
-	       "  --pt <file>[:<from>[-<to>]]   load the processor trace data from <file>.\n"
-	       "                                an optional offset or range can be given.\n"
+	printf("usage: %s [<options>]\n\n", name);
+	printf("options:\n");
+	printf("  --help|-h                            this text.\n");
+	printf("  --version                            display version information and exit.\n");
+	printf("  --att                                print instructions in att format.\n");
+	printf("  --no-inst                            do not print instructions (only addresses).\n");
+	printf("  --quiet|-q                           do not print anything (except errors).\n");
+	printf("  --offset                             print the offset into the trace file.\n");
+	printf("  --raw-insn                           print the raw bytes of each instruction.\n");
+	printf("  --stat                               print statistics (even when quiet).\n");
+	printf("                                       collects all statistics unless one or more are selected.\n");
+	printf("  --stat:insn                          collect number of instructions.\n");
+	printf("  --verbose|-v                         print various information (even when quiet).\n");
+	printf("  --pt <file>[:<from>[-<to>]]          load the processor trace data from <file>.\n");
+	printf("                                       an optional offset or range can be given.\n");
 #if defined(FEATURE_ELF)
-	       "  --elf <<file>[:<base>]        load an ELF from <file> at address <base>.\n"
-	       "                                use the default load address if <base> is omitted.\n"
+	printf("  --elf <<file>[:<base>]               load an ELF from <file> at address <base>.\n");
+	printf("                                       use the default load address if <base> is omitted.\n");
 #endif /* defined(FEATURE_ELF) */
-	       "  --raw <file>:<base>           load a raw binary from <file> at address <base>.\n"
-	       "  --cpu none|auto|f/m[/s]       set cpu to the given value and decode according to:\n"
-	       "                                  none     spec (default)\n"
-	       "                                  auto     current cpu\n"
-	       "                                  f/m[/s]  family/model[/stepping]\n"
-	       "  --mtc-freq <n>                set the MTC frequency (IA32_RTIT_CTL[17:14]) to <n>.\n"
-	       "  --nom-freq <n>                set the nominal frequency (MSR_PLATFORM_INFO[15:8]) to <n>.\n"
-	       "  --cpuid-0x15.eax              set the value of cpuid[0x15].eax.\n"
-	       "  --cpuid-0x15.ebx              set the value of cpuid[0x15].ebx.\n"
-	       "\n"
+	printf("  --raw <file>[:<from>[-<to>]]:<base>  load a raw binary from <file> at address <base>.\n");
+	printf("                                       an optional offset or range can be given.\n");
+	printf("  --cpu none|auto|f/m[/s]              set cpu to the given value and decode according to:\n");
+	printf("                                         none     spec (default)\n");
+	printf("                                         auto     current cpu\n");
+	printf("                                         f/m[/s]  family/model[/stepping]\n");
+	printf("  --mtc-freq <n>                       set the MTC frequency (IA32_RTIT_CTL[17:14]) to <n>.\n");
+	printf("  --nom-freq <n>                       set the nominal frequency (MSR_PLATFORM_INFO[15:8]) to <n>.\n");
+	printf("  --cpuid-0x15.eax                     set the value of cpuid[0x15].eax.\n");
+	printf("  --cpuid-0x15.ebx                     set the value of cpuid[0x15].ebx.\n");
+	printf("  --insn-decoder                       use the instruction flow decoder (default).\n");
+	printf("  --block-decoder                      use the block decoder.\n");
+	printf("  --block:show-blocks                  show blocks in the output.\n");
+	printf("  --block:end-on-call                  set the end-on-call block decoder flag.\n");
+	printf("\n");
 #if defined(FEATURE_ELF)
-	       "You must specify at least one binary or ELF file (--raw|--elf).\n"
+	printf("You must specify at least one binary or ELF file (--raw|--elf).\n");
 #else /* defined(FEATURE_ELF) */
-	       "You must specify at least one binary file (--raw).\n"
+	printf("You must specify at least one binary file (--raw).\n");
 #endif /* defined(FEATURE_ELF) */
-	       "You must specify exactly one processor trace file (--pt).\n",
-	       name);
+	printf("You must specify exactly one processor trace file (--pt).\n");
 }
 
 static int extract_base(char *arg, uint64_t *base)
@@ -175,94 +242,130 @@ static int parse_range(const char *arg, uint64_t *begin, uint64_t *end)
 	return 2;
 }
 
-static int load_file(uint8_t **buffer, size_t *size, char *arg,
-		     const char *prog)
+/* Preprocess a filename argument.
+ *
+ * A filename may optionally be followed by a file offset or a file range
+ * argument separated by ':'.  Split the original argument into the filename
+ * part and the offset/range part.
+ *
+ * If no end address is specified, set @size to zero.
+ * If no offset is specified, set @offset to zero.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ */
+static int preprocess_filename(char *filename, uint64_t *offset, uint64_t *size)
 {
-	uint64_t begin_arg, end_arg;
+	uint64_t begin, end;
+	char *range;
+	int parts;
+
+	if (!filename || !offset || !size)
+		return -pte_internal;
+
+	/* Search from the end as the filename may also contain ':'. */
+	range = strrchr(filename, ':');
+	if (!range) {
+		*offset = 0ull;
+		*size = 0ull;
+
+		return 0;
+	}
+
+	/* Let's try to parse an optional range suffix.
+	 *
+	 * If we can, remove it from the filename argument.
+	 * If we can not, assume that the ':' is part of the filename, e.g. a
+	 * drive letter on Windows.
+	 */
+	parts = parse_range(range + 1, &begin, &end);
+	if (parts <= 0) {
+		*offset = 0ull;
+		*size = 0ull;
+
+		return 0;
+	}
+
+	if (parts == 1) {
+		*offset = begin;
+		*size = 0ull;
+
+		*range = 0;
+
+		return 0;
+	}
+
+	if (parts == 2) {
+		if (end <= begin)
+			return -pte_invalid;
+
+		*offset = begin;
+		*size = end - begin;
+
+		*range = 0;
+
+		return 0;
+	}
+
+	return -pte_internal;
+}
+
+static int load_file(uint8_t **buffer, size_t *psize, const char *filename,
+		     uint64_t offset, uint64_t size, const char *prog)
+{
 	uint8_t *content;
 	size_t read;
 	FILE *file;
 	long fsize, begin, end;
-	int errcode, range_parts;
-	char *range;
+	int errcode;
 
-	if (!buffer || !size || !arg || !prog) {
+	if (!buffer || !psize || !filename || !prog) {
 		fprintf(stderr, "%s: internal error.\n", prog ? prog : "");
 		return -1;
 	}
 
-	range_parts = 0;
-	begin_arg = 0ull;
-	end_arg = UINT64_MAX;
-
-	range = strrchr(arg, ':');
-	if (range) {
-		/* Let's try to parse an optional range suffix.
-		 *
-		 * If we can, remove it from the filename argument.
-		 * If we can not, assume that the ':' is part of the filename,
-		 * e.g. a drive letter on Windows.
-		 */
-		range_parts = parse_range(range + 1, &begin_arg, &end_arg);
-		if (range_parts <= 0) {
-			begin_arg = 0ull;
-			end_arg = UINT64_MAX;
-
-			range_parts = 0;
-		} else
-			*range = 0;
-	}
-
 	errno = 0;
-	file = fopen(arg, "rb");
+	file = fopen(filename, "rb");
 	if (!file) {
 		fprintf(stderr, "%s: failed to open %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		return -1;
 	}
 
 	errcode = fseek(file, 0, SEEK_END);
 	if (errcode) {
 		fprintf(stderr, "%s: failed to determine size of %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_file;
 	}
 
 	fsize = ftell(file);
 	if (fsize < 0) {
 		fprintf(stderr, "%s: failed to determine size of %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_file;
 	}
 
-	/* Truncate the range to fit into the file unless an explicit range end
-	 * was provided.
-	 */
-	if (range_parts < 2)
-		end_arg = (uint64_t) fsize;
-
-	begin = (long) begin_arg;
-	end = (long) end_arg;
-	if ((uint64_t) begin != begin_arg || (uint64_t) end != end_arg) {
-		fprintf(stderr, "%s: invalid offset/range argument.\n", prog);
+	begin = (long) offset;
+	if (((uint64_t) begin != offset) || (fsize <= begin)) {
+		fprintf(stderr,
+			"%s: bad offset 0x%" PRIx64 " into %s.\n",
+			prog, offset, filename);
 		goto err_file;
 	}
 
-	if (fsize <= begin) {
-		fprintf(stderr, "%s: offset 0x%lx outside of %s.\n",
-			prog, begin, arg);
-		goto err_file;
-	}
+	end = fsize;
+	if (size) {
+		uint64_t range_end;
 
-	if (fsize < end) {
-		fprintf(stderr, "%s: range 0x%lx outside of %s.\n",
-			prog, end, arg);
-		goto err_file;
-	}
+		range_end = offset + size;
+		if ((uint64_t) end < range_end) {
+			fprintf(stderr,
+				"%s: bad range 0x%" PRIx64 " in %s.\n",
+				prog, range_end, filename);
+			goto err_file;
+		}
 
-	if (end <= begin) {
-		fprintf(stderr, "%s: bad range.\n", prog);
-		goto err_file;
+		end = (long) range_end;
 	}
 
 	fsize = end - begin;
@@ -270,28 +373,28 @@ static int load_file(uint8_t **buffer, size_t *size, char *arg,
 	content = malloc(fsize);
 	if (!content) {
 		fprintf(stderr, "%s: failed to allocated memory %s.\n",
-			prog, arg);
+			prog, filename);
 		goto err_file;
 	}
 
 	errcode = fseek(file, begin, SEEK_SET);
 	if (errcode) {
 		fprintf(stderr, "%s: failed to load %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_content;
 	}
 
 	read = fread(content, fsize, 1, file);
 	if (read != 1) {
 		fprintf(stderr, "%s: failed to load %s: %d.\n",
-			prog, arg, errno);
+			prog, filename, errno);
 		goto err_content;
 	}
 
 	fclose(file);
 
 	*buffer = content;
-	*size = fsize;
+	*psize = fsize;
 
 	return 0;
 
@@ -305,11 +408,19 @@ err_file:
 
 static int load_pt(struct pt_config *config, char *arg, const char *prog)
 {
+	uint64_t foffset, fsize;
 	uint8_t *buffer;
 	size_t size;
 	int errcode;
 
-	errcode = load_file(&buffer, &size, arg, prog);
+	errcode = preprocess_filename(arg, &foffset, &fsize);
+	if (errcode < 0) {
+		fprintf(stderr, "%s: bad file %s: %s.\n", prog, arg,
+			pt_errstr(pt_errcode(errcode)));
+		return -1;
+	}
+
+	errcode = load_file(&buffer, &size, arg, foffset, fsize, prog);
 	if (errcode < 0)
 		return errcode;
 
@@ -319,20 +430,38 @@ static int load_pt(struct pt_config *config, char *arg, const char *prog)
 	return 0;
 }
 
-static int load_raw(struct pt_image *image, char *arg, const char *prog)
+static int load_raw(struct pt_image_section_cache *iscache,
+		    struct pt_image *image, char *arg, const char *prog)
 {
-	uint64_t base;
-	int errcode, has_base;
+	uint64_t base, foffset, fsize;
+	int isid, errcode, has_base;
 
 	has_base = extract_base(arg, &base);
 	if (has_base <= 0)
-		return 1;
+		return -1;
 
-	errcode = pt_image_add_file(image, arg, 0, UINT64_MAX, NULL, base);
+	errcode = preprocess_filename(arg, &foffset, &fsize);
+	if (errcode < 0) {
+		fprintf(stderr, "%s: bad file %s: %s.\n", prog, arg,
+			pt_errstr(pt_errcode(errcode)));
+		return -1;
+	}
+
+	if (!fsize)
+		fsize = UINT64_MAX;
+
+	isid = pt_iscache_add_file(iscache, arg, foffset, fsize, base);
+	if (isid < 0) {
+		fprintf(stderr, "%s: failed to add %s at 0x%" PRIx64 ": %s.\n",
+			prog, arg, base, pt_errstr(pt_errcode(isid)));
+		return -1;
+	}
+
+	errcode = pt_image_add_cached(image, iscache, isid, NULL);
 	if (errcode < 0) {
 		fprintf(stderr, "%s: failed to add %s at 0x%" PRIx64 ": %s.\n",
 			prog, arg, base, pt_errstr(pt_errcode(errcode)));
-		return 1;
+		return -1;
 	}
 
 	return 0;
@@ -355,6 +484,47 @@ static xed_machine_mode_enum_t translate_mode(enum pt_exec_mode mode)
 	}
 
 	return XED_MACHINE_MODE_INVALID;
+}
+
+static void xed_print_insn(const xed_decoded_inst_t *inst, uint64_t ip,
+			   const struct ptxed_options *options)
+{
+	xed_print_info_t pi;
+	char buffer[256];
+	xed_bool_t ok;
+
+	if (!inst || !options) {
+		printf(" [internal error]");
+		return;
+	}
+
+	if (options->print_raw_insn) {
+		xed_uint_t length, i;
+
+		length = xed_decoded_inst_get_length(inst);
+		for (i = 0; i < length; ++i)
+			printf(" %02x", xed_decoded_inst_get_byte(inst, i));
+
+		for (; i < pt_max_insn_size; ++i)
+			printf("   ");
+	}
+
+	xed_init_print_info(&pi);
+	pi.p = inst;
+	pi.buf = buffer;
+	pi.blen = sizeof(buffer);
+	pi.runtime_address = ip;
+
+	if (options->att_format)
+		pi.syntax = XED_SYNTAX_ATT;
+
+	ok = xed_format_generic(&pi);
+	if (!ok) {
+		printf(" [xed print error]");
+		return;
+	}
+
+	printf("  %s", buffer);
 }
 
 static void print_insn(const struct pt_insn *insn, xed_state_t *xed,
@@ -382,17 +552,6 @@ static void print_insn(const struct pt_insn *insn, xed_state_t *xed,
 
 	printf("%016" PRIx64, insn->ip);
 
-	if (options->print_raw_insn) {
-		uint8_t i;
-
-		printf(" ");
-		for (i = 0; i < insn->size; ++i)
-			printf(" %02x", insn->raw[i]);
-
-		for (; i < sizeof(insn->raw); ++i)
-			printf("   ");
-	}
-
 	if (!options->dont_print_insn) {
 		xed_machine_mode_enum_t mode;
 		xed_decoded_inst_t inst;
@@ -405,28 +564,8 @@ static void print_insn(const struct pt_insn *insn, xed_state_t *xed,
 
 		errcode = xed_decode(&inst, insn->raw, insn->size);
 		switch (errcode) {
-		case XED_ERROR_NONE: {
-			xed_print_info_t pi;
-			char buffer[256];
-			xed_bool_t ok;
-
-			xed_init_print_info(&pi);
-			pi.p = &inst;
-			pi.buf = buffer;
-			pi.blen = sizeof(buffer);
-			pi.runtime_address = insn->ip;
-
-			if (options->att_format)
-				pi.syntax = XED_SYNTAX_ATT;
-
-			ok = xed_format_generic(&pi);
-			if (!ok) {
-				printf(" [xed print error]");
-				break;
-			}
-
-			printf("  %s", buffer);
-		}
+		case XED_ERROR_NONE:
+			xed_print_insn(&inst, insn->ip, options);
 			break;
 
 		default:
@@ -454,8 +593,8 @@ static void print_insn(const struct pt_insn *insn, xed_state_t *xed,
 		printf("[stopped]\n");
 }
 
-static void diagnose(const char *errtype, struct pt_insn_decoder *decoder,
-		     const struct pt_insn *insn, int errcode)
+static void diagnose_insn(const char *errtype, struct pt_insn_decoder *decoder,
+			  struct pt_insn *insn, int errcode)
 {
 	int err;
 	uint64_t pos;
@@ -471,9 +610,9 @@ static void diagnose(const char *errtype, struct pt_insn_decoder *decoder,
 		       insn->ip, errtype, pt_errstr(pt_errcode(errcode)));
 }
 
-static void decode(struct pt_insn_decoder *decoder,
-		   const struct ptxed_options *options,
-		   struct ptxed_stats *stats)
+static void decode_insn(struct pt_insn_decoder *decoder,
+			const struct ptxed_options *options,
+			struct ptxed_stats *stats)
 {
 	xed_state_t xed;
 	uint64_t offset, sync;
@@ -501,7 +640,7 @@ static void decode(struct pt_insn_decoder *decoder,
 			if (errcode == -pte_eos)
 				break;
 
-			diagnose("sync error", decoder, &insn, errcode);
+			diagnose_insn("sync error", decoder, &insn, errcode);
 
 			/* Let's see if we made any progress.  If we haven't,
 			 * we likely never will.  Bail out.
@@ -562,7 +701,317 @@ static void decode(struct pt_insn_decoder *decoder,
 		if (errcode == -pte_eos)
 			break;
 
-		diagnose("error", decoder, &insn, errcode);
+		diagnose_insn("error", decoder, &insn, errcode);
+	}
+}
+
+static void diagnose_block_at(const char *errtype, uint64_t pos,
+			      struct pt_block *block, int errcode)
+{
+	if (!block) {
+		printf("ptxed: internal error");
+		return;
+	}
+
+	if (block->ninsn)
+		printf("[%" PRIx64 ", %" PRIx64 "(+%x): %s: %s]\n", pos,
+		       block->ip, block->ninsn, errtype,
+		       pt_errstr(pt_errcode(errcode)));
+	else
+		printf("[%" PRIx64 ", %" PRIx64 ": %s: %s]\n", pos,
+		       block->ip, errtype,
+		       pt_errstr(pt_errcode(errcode)));
+}
+
+static void diagnose_block(const char *errtype,
+			   struct pt_block_decoder *decoder,
+			   struct pt_block *block, int errcode)
+{
+	int err;
+	uint64_t pos;
+
+	if (!block) {
+		printf("ptxed: internal error");
+		return;
+	}
+
+	err = pt_blk_get_offset(decoder, &pos);
+	if (err < 0) {
+		printf("could not determine offset: %s\n",
+		       pt_errstr(pt_errcode(err)));
+		if (block->ninsn)
+			printf("[?, %" PRIx64 "(+%x): %s: %s]\n", block->ip,
+			       block->ninsn, errtype,
+			       pt_errstr(pt_errcode(errcode)));
+		else
+			printf("[?, %" PRIx64 ": %s: %s]\n", block->ip, errtype,
+			       pt_errstr(pt_errcode(errcode)));
+	} else
+		diagnose_block_at(errtype, pos, block, errcode);
+}
+
+static int xed_next_ip(uint64_t *pip, const xed_decoded_inst_t *inst,
+		       uint64_t ip)
+{
+	xed_uint_t length, disp_width;
+
+	if (!pip || !inst)
+		return -pte_internal;
+
+	length = xed_decoded_inst_get_length(inst);
+	if (!length) {
+		printf("[xed error: failed to determine instruction length]\n");
+		return -pte_bad_insn;
+	}
+
+	ip += length;
+
+	/* If it got a branch displacement it must be a branch.
+	 *
+	 * This includes conditional branches for which we don't know whether
+	 * they were taken.  The next IP won't be used in this case as a
+	 * conditional branch ends a block.  The next block will start with the
+	 * correct IP.
+	 */
+	disp_width = xed_decoded_inst_get_branch_displacement_width(inst);
+	if (disp_width)
+		ip += xed_decoded_inst_get_branch_displacement(inst);
+
+	*pip = ip;
+	return 0;
+}
+
+static void print_block(struct pt_block *block,
+			struct pt_image_section_cache *iscache,
+			const struct ptxed_options *options,
+			const struct ptxed_stats *stats,
+			uint64_t offset)
+{
+	xed_machine_mode_enum_t mode;
+	xed_state_t xed;
+	uint64_t last_ip;
+
+	if (!block || !options) {
+		printf("[internal error]\n");
+		return;
+	}
+
+	if (block->resynced)
+		printf("[overflow]\n");
+
+	if (block->enabled)
+		printf("[enabled]\n");
+
+	if (block->resumed)
+		printf("[resumed]\n");
+
+	if (options->track_blocks) {
+		printf("[block");
+		if (stats)
+			printf(" %" PRIx64, stats->blocks);
+		printf("]\n");
+	}
+
+	mode = translate_mode(block->mode);
+	xed_state_init2(&xed, mode, XED_ADDRESS_WIDTH_INVALID);
+
+	last_ip = 0ull;
+	for (; block->ninsn; --block->ninsn) {
+		xed_decoded_inst_t inst;
+		xed_error_enum_t xederrcode;
+		uint8_t raw[pt_max_insn_size], *praw;
+		int size, errcode;
+
+		/* For truncated block, the last instruction is provided in the
+		 * block since it can't be read entirely from the image section
+		 * cache.
+		 */
+		if (block->truncated && (block->ninsn == 1)) {
+			praw = block->raw;
+			size = block->size;
+		} else {
+			praw = raw;
+			size = pt_iscache_read(iscache, raw, sizeof(raw),
+					       block->isid, block->ip);
+			if (size < 0) {
+				printf(" [error reading insn: (%d) %s]\n", size,
+				       pt_errstr(pt_errcode(size)));
+				break;
+			}
+		}
+
+		xed_decoded_inst_zero_set_mode(&inst, &xed);
+
+		if (block->speculative)
+			printf("? ");
+
+		if (options->print_offset)
+			printf("%016" PRIx64 "  ", offset);
+
+		printf("%016" PRIx64, block->ip);
+
+		xederrcode = xed_decode(&inst, praw, size);
+		if (xederrcode != XED_ERROR_NONE) {
+			printf(" [xed decode error: (%u) %s]\n", xederrcode,
+			       xed_error_enum_t2str(xederrcode));
+			break;
+		}
+
+		if (!options->dont_print_insn)
+			xed_print_insn(&inst, block->ip, options);
+
+		printf("\n");
+
+		last_ip = block->ip;
+
+		errcode = xed_next_ip(&block->ip, &inst, last_ip);
+		if (errcode < 0) {
+			diagnose_block_at("reconstruct error", offset, block,
+					  errcode);
+			break;
+		}
+	}
+
+	/* Decode should have brought us to @block->end_ip. */
+	if (last_ip != block->end_ip)
+		diagnose_block_at("reconstruct error", offset, block,
+				  -pte_nosync);
+
+	if (block->interrupted)
+		printf("[interrupt]\n");
+
+	if (block->aborted)
+		printf("[aborted]\n");
+
+	if (block->committed)
+		printf("[committed]\n");
+
+	if (block->disabled)
+		printf("[disabled]\n");
+
+	if (block->stopped)
+		printf("[stopped]\n");
+}
+
+static void decode_block(struct pt_block_decoder *decoder,
+			 struct pt_image_section_cache *iscache,
+			 const struct ptxed_options *options,
+			 struct ptxed_stats *stats)
+{
+	uint64_t offset, sync;
+
+	if (!options) {
+		printf("[internal error]\n");
+		return;
+	}
+
+	offset = 0ull;
+	sync = 0ull;
+	for (;;) {
+		struct pt_block block;
+		int errcode;
+
+		/* Initialize IP and ninsn - we use it for error reporting. */
+		block.ip = 0ull;
+		block.ninsn = 0u;
+
+		errcode = pt_blk_sync_forward(decoder);
+		if (errcode < 0) {
+			uint64_t new_sync;
+
+			if (errcode == -pte_eos)
+				break;
+
+			diagnose_block("sync error", decoder, &block, errcode);
+
+			/* Let's see if we made any progress.  If we haven't,
+			 * we likely never will.  Bail out.
+			 *
+			 * We intentionally report the error twice to indicate
+			 * that we tried to re-sync.  Maybe it even changed.
+			 */
+			errcode = pt_blk_get_offset(decoder, &new_sync);
+			if (errcode < 0 || (new_sync <= sync))
+				break;
+
+			sync = new_sync;
+			continue;
+		}
+
+		for (;;) {
+			if (options->print_offset) {
+				errcode = pt_blk_get_offset(decoder, &offset);
+				if (errcode < 0)
+					break;
+			}
+
+			errcode = pt_blk_next(decoder, &block, sizeof(block));
+			if (errcode < 0) {
+				/* Even in case of errors, we may have succeeded
+				 * in decoding some instructions.
+				 */
+				if (block.ninsn) {
+					if (stats) {
+						stats->insn += block.ninsn;
+						stats->blocks += 1;
+					}
+
+					if (!options->quiet)
+						print_block(&block, iscache,
+							    options, stats,
+							    offset);
+				}
+				break;
+			}
+
+			if (stats) {
+				stats->insn += block.ninsn;
+				stats->blocks += 1;
+			}
+
+			if (!options->quiet)
+				print_block(&block, iscache, options, stats,
+					    offset);
+
+			if (errcode & pts_eos) {
+				if (!block.disabled && !options->quiet)
+					printf("[end of trace]\n");
+
+				errcode = -pte_eos;
+				break;
+			}
+		}
+
+		/* We shouldn't break out of the loop without an error. */
+		if (!errcode)
+			errcode = -pte_internal;
+
+		/* We're done when we reach the end of the trace stream. */
+		if (errcode == -pte_eos)
+			break;
+
+		diagnose_block("error", decoder, &block, errcode);
+	}
+}
+
+static void decode(struct ptxed_decoder *decoder,
+		   struct pt_image_section_cache *iscache,
+		   const struct ptxed_options *options,
+		   struct ptxed_stats *stats)
+{
+	if (!decoder) {
+		printf("[internal error]\n");
+		return;
+	}
+
+	switch (decoder->type) {
+	case pdt_insn_decoder:
+		decode_insn(decoder->variant.insn, options, stats);
+		break;
+
+	case pdt_block_decoder:
+		decode_block(decoder->variant.block, iscache, options, stats);
+		break;
 	}
 }
 
@@ -573,7 +1022,11 @@ static void print_stats(struct ptxed_stats *stats)
 		return;
 	}
 
-	printf("insn: %" PRIu64 ".\n", stats->insn);
+	if (stats->flags & ptxed_stat_insn)
+		printf("insn: %" PRIu64 ".\n", stats->insn);
+
+	if (stats->flags & ptxed_stat_blocks)
+		printf("blocks:\t%" PRIu64 ".\n", stats->blocks);
 }
 
 static int get_arg_uint64(uint64_t *value, const char *option, const char *arg,
@@ -642,7 +1095,8 @@ static int get_arg_uint8(uint8_t *value, const char *option, const char *arg,
 
 extern int main(int argc, char *argv[])
 {
-	struct pt_insn_decoder *decoder;
+	struct pt_image_section_cache *iscache;
+	struct ptxed_decoder decoder;
 	struct ptxed_options options;
 	struct ptxed_stats stats;
 	struct pt_config config;
@@ -656,17 +1110,28 @@ extern int main(int argc, char *argv[])
 	}
 
 	prog = argv[0];
-	decoder = NULL;
+	iscache = NULL;
+	image = NULL;
+
+	memset(&decoder, 0, sizeof(decoder));
+	decoder.type = pdt_block_decoder;
 
 	memset(&options, 0, sizeof(options));
 	memset(&stats, 0, sizeof(stats));
 
 	pt_config_init(&config);
 
+	iscache = pt_iscache_alloc(NULL);
+	if (!iscache) {
+		fprintf(stderr,
+			"%s: failed to allocate image section cache.\n", prog);
+		goto err;
+	}
+
 	image = pt_image_alloc(NULL);
 	if (!image) {
 		fprintf(stderr, "%s: failed to allocate image.\n", prog);
-		return 1;
+		goto err;
 	}
 
 	for (i = 1; i < argc;) {
@@ -690,7 +1155,7 @@ extern int main(int argc, char *argv[])
 			}
 			arg = argv[i++];
 
-			if (decoder) {
+			if (ptxed_have_decoder(&decoder)) {
 				fprintf(stderr,
 					"%s: duplicate pt sources: %s.\n",
 					prog, arg);
@@ -705,20 +1170,46 @@ extern int main(int argc, char *argv[])
 			if (errcode < 0)
 				goto err;
 
-			decoder = pt_insn_alloc_decoder(&config);
-			if (!decoder) {
-				fprintf(stderr,
-					"%s: failed to create decoder.\n",
-					prog);
-				goto err;
-			}
+			switch (decoder.type) {
+			case pdt_insn_decoder:
+				decoder.variant.insn =
+					pt_insn_alloc_decoder(&config);
+				if (!decoder.variant.insn) {
+					fprintf(stderr, "%s: failed to create "
+						"decoder.\n", prog);
+					goto err;
+				}
 
-			errcode = pt_insn_set_image(decoder, image);
-			if (errcode < 0) {
-				fprintf(stderr,
-					"%s: failed to set image.\n",
-					prog);
-				goto err;
+				errcode =
+					pt_insn_set_image(decoder.variant.insn,
+							  image);
+				if (errcode < 0) {
+					fprintf(stderr,
+						"%s: failed to set image.\n",
+						prog);
+					goto err;
+				}
+				break;
+
+			case pdt_block_decoder:
+				decoder.variant.block =
+					pt_blk_alloc_decoder(&config);
+				if (!decoder.variant.block) {
+					fprintf(stderr, "%s: failed to create "
+						"decoder.\n", prog);
+					goto err;
+				}
+
+				errcode =
+					pt_blk_set_image(decoder.variant.block,
+							 image);
+				if (errcode < 0) {
+					fprintf(stderr,
+						"%s: failed to set image.\n",
+						prog);
+					goto err;
+				}
+				break;
 			}
 
 			continue;
@@ -731,7 +1222,7 @@ extern int main(int argc, char *argv[])
 			}
 			arg = argv[i++];
 
-			errcode = load_raw(image, arg, prog);
+			errcode = load_raw(iscache, image, arg, prog);
 			if (errcode < 0)
 				goto err;
 
@@ -752,7 +1243,7 @@ extern int main(int argc, char *argv[])
 			if (errcode < 0)
 				goto err;
 
-			errcode = load_elf(image, arg, base, prog,
+			errcode = load_elf(iscache, image, arg, base, prog,
 					   options.track_image);
 			if (errcode < 0)
 				goto err;
@@ -784,11 +1275,19 @@ extern int main(int argc, char *argv[])
 			options.print_stats = 1;
 			continue;
 		}
+		if (strcmp(arg, "--stat:insn") == 0) {
+			stats.flags |= ptxed_stat_insn;
+			continue;
+		}
+		if (strcmp(arg, "--stat:blocks") == 0) {
+			stats.flags |= ptxed_stat_blocks;
+			continue;
+		}
 		if (strcmp(arg, "--cpu") == 0) {
 			/* override cpu information before the decoder
 			 * is initialized.
 			 */
-			if (decoder) {
+			if (ptxed_have_decoder(&decoder)) {
 				fprintf(stderr,
 					"%s: please specify cpu before the pt source file.\n",
 					prog);
@@ -862,28 +1361,76 @@ extern int main(int argc, char *argv[])
 			continue;
 		}
 
+		if (strcmp(arg, "--insn-decoder") == 0) {
+			if (ptxed_have_decoder(&decoder)) {
+				fprintf(stderr,
+					"%s: please specify %s before the pt "
+					"source file.\n", arg, prog);
+				goto err;
+			}
+
+			decoder.type = pdt_insn_decoder;
+			continue;
+		}
+
+		if (strcmp(arg, "--block-decoder") == 0) {
+			if (ptxed_have_decoder(&decoder)) {
+				fprintf(stderr,
+					"%s: please specify %s before the pt "
+					"source file.\n", arg, prog);
+				goto err;
+			}
+
+			decoder.type = pdt_block_decoder;
+			continue;
+		}
+
+		if (strcmp(arg, "--block:show-blocks") == 0) {
+			options.track_blocks = 1;
+			continue;
+		}
+
+		if (strcmp(arg, "--block:end-on-call") == 0) {
+			config.flags.variant.block.end_on_call = 1;
+			continue;
+		}
+
 		fprintf(stderr, "%s: unknown option: %s.\n", prog, arg);
 		goto err;
 	}
 
-	if (!decoder) {
+	if (!ptxed_have_decoder(&decoder)) {
 		fprintf(stderr, "%s: no pt file.\n", prog);
 		goto err;
 	}
 
 	xed_tables_init();
-	decode(decoder, &options, &stats);
+
+	/* If we didn't select any statistics, select them all depending on the
+	 * decoder type.
+	 */
+	if (options.print_stats && !stats.flags) {
+		stats.flags |= ptxed_stat_insn;
+
+		if (decoder.type == pdt_block_decoder)
+			stats.flags |= ptxed_stat_blocks;
+	}
+
+	decode(&decoder, iscache, &options,
+	       options.print_stats ? &stats : NULL);
 
 	if (options.print_stats)
 		print_stats(&stats);
 
 out:
-	pt_insn_free_decoder(decoder);
+	ptxed_free_decoder(&decoder);
 	pt_image_free(image);
+	pt_iscache_free(iscache);
 	return 0;
 
 err:
-	pt_insn_free_decoder(decoder);
+	ptxed_free_decoder(&decoder);
 	pt_image_free(image);
+	pt_iscache_free(iscache);
 	return 1;
 }

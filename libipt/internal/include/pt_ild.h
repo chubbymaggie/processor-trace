@@ -29,52 +29,10 @@
 #if !defined(PT_ILD_H)
 #define PT_ILD_H
 
+#include "pt_insn.h"
+
 #include "intel-pt.h"
 
-typedef enum {
-	PTI_INST_INVALID,
-
-	PTI_INST_CALL_9A,
-	PTI_INST_CALL_FFr3,
-	PTI_INST_CALL_FFr2,
-	PTI_INST_CALL_E8,
-	PTI_INST_INT,
-
-	PTI_INST_INT3,
-	PTI_INST_INT1,
-	PTI_INST_INTO,
-	PTI_INST_IRET,	/* includes IRETD and IRETQ (EOSZ determines) */
-
-	PTI_INST_JMP_E9,
-	PTI_INST_JMP_EB,
-	PTI_INST_JMP_EA,
-	PTI_INST_JMP_FFr5,	/* REXW? */
-	PTI_INST_JMP_FFr4,
-	PTI_INST_JCC,
-	PTI_INST_JrCXZ,
-	PTI_INST_LOOP,
-	PTI_INST_LOOPE,	/* aka Z */
-	PTI_INST_LOOPNE,	/* aka NE */
-
-	PTI_INST_MOV_CR3,
-
-	PTI_INST_RET_C3,
-	PTI_INST_RET_C2,
-	PTI_INST_RET_CB,
-	PTI_INST_RET_CA,
-
-	PTI_INST_SYSCALL,
-	PTI_INST_SYSENTER,
-	PTI_INST_SYSEXIT,
-	PTI_INST_SYSRET,
-
-	PTI_INST_VMLAUNCH,
-	PTI_INST_VMRESUME,
-	PTI_INST_VMCALL,
-	PTI_INST_VMPTRLD,
-
-	PTI_INST_LAST
-} pti_inst_enum_t;
 
 typedef enum {
 	PTI_MAP_0,	/* 1-byte opcodes.           may have modrm */
@@ -87,37 +45,12 @@ typedef enum {
 
 struct pt_ild {
 	/* inputs */
-	uint64_t runtime_address;
 	uint8_t const *itext;
 	uint8_t max_bytes;	/*1..15 bytes  */
 	enum pt_exec_mode mode;
 
-	/* outputs */
-	uint8_t length;	/* bytes */
-	pti_inst_enum_t iclass;
-	uint64_t direct_target;	/* if direct_indirect = 1 */
 	union {
 		struct {
-			uint32_t branch:1;	/* direct or indirect */
-
-			/* direct jmp, direct call or rel/direct branch sets
-			 * branch_direct = 1.
-			 *
-			 * 1=direct, 0=indirect
-			 */
-			uint32_t branch_direct:1;
-
-			/* this includes other transfers like SYSENTER,
-			 * SYSEXIT, and IRET.
-			 *
-			 * 1=far, 0=near
-			 */
-			uint32_t branch_far:1;
-
-			uint32_t ret:1;
-			uint32_t call:1;
-			uint32_t cond:1;
-			/* internal fields */
 			uint32_t osz:1;
 			uint32_t asz:1;
 			uint32_t lock:1;
@@ -171,13 +104,25 @@ extern void pt_ild_init(void);
 
 /* all decoding is multithread safe. */
 
-/* Returns zero on success, a negative error code otherwise. */
-extern int pt_instruction_length_decode(struct pt_ild *ild);
-
-/* Returns a positive number if an interesting instruction was encountered.
- * Returns zero if a non-interesting instruction was encountered.
- * Returns a negative error code otherwise.
+/* Decode one instruction.
+ *
+ * Input:
+ *
+ *   @insn->ip:      the virtual address of the instruction
+ *   @insn->raw:     the memory at that virtual address
+ *   @insn->size:    the maximal size of the instruction
+ *   @insn->mode:    the execution mode
+ *
+ * Output:
+ *
+ *   @insn->size:    the actual size of the instruction
+ *   @insn->iclass:  a coarse classification
+ *
+ *   @iext->iclass:  a finer grain classification
+ *   @iext->variant: instruction class dependent information
+ *
+ * Returns zero on success, a negative error code otherwise.
  */
-extern int pt_instruction_decode(struct pt_ild *ild);
+extern int pt_ild_decode(struct pt_insn *insn, struct pt_insn_ext *iext);
 
 #endif /* PT_ILD_H */

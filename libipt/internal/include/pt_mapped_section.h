@@ -30,10 +30,9 @@
 #define PT_MAPPED_SECTION_H
 
 #include "intel-pt.h"
+#include "pt_section.h"
 
 #include <stdint.h>
-
-struct pt_section;
 
 
 /* A section mapped into memory. */
@@ -50,57 +49,84 @@ struct pt_mapped_section {
 
 
 /* Initialize a mapped section - @section may be NULL. */
-extern void pt_msec_init(struct pt_mapped_section *msec,
-			 struct pt_section *section, const struct pt_asid *asid,
-			 uint64_t vaddr);
+static inline void pt_msec_init(struct pt_mapped_section *msec,
+				struct pt_section *section,
+				const struct pt_asid *asid,
+				uint64_t vaddr)
+{
+	if (!msec)
+		return;
+
+	msec->section = section;
+	msec->vaddr = vaddr;
+
+	if (asid)
+		msec->asid = *asid;
+	else
+		pt_asid_init(&msec->asid);
+}
 
 /* Destroy a mapped section - does not free @msec->section. */
-extern void pt_msec_fini(struct pt_mapped_section *msec);
+static inline void pt_msec_fini(struct pt_mapped_section *msec)
+{
+	(void) msec;
+
+	/* Nothing to do. */
+}
 
 /* Return the virtual address of the beginning of the memory region. */
-extern uint64_t pt_msec_begin(const struct pt_mapped_section *msec);
+static inline uint64_t pt_msec_begin(const struct pt_mapped_section *msec)
+{
+	if (!msec)
+		return 0ull;
+
+	return msec->vaddr;
+}
 
 /* Return the virtual address one byte past the end of the memory region. */
-extern uint64_t pt_msec_end(const struct pt_mapped_section *msec);
+static inline uint64_t pt_msec_end(const struct pt_mapped_section *msec)
+{
+	uint64_t size;
+
+	if (!msec)
+		return 0ull;
+
+	size = pt_section_size(msec->section);
+	if (size)
+		size += msec->vaddr;
+
+	return size;
+}
+
+/* Return the underlying section. */
+static inline struct pt_section *
+pt_msec_section(const struct pt_mapped_section *msec)
+{
+	return msec->section;
+}
 
 /* Return an identifier for the address-space the section is mapped into. */
-extern const struct pt_asid *pt_msec_asid(const struct pt_mapped_section *msec);
+static inline const struct pt_asid *
+pt_msec_asid(const struct pt_mapped_section *msec)
+{
+	if (!msec)
+		return NULL;
 
-/* Check if a section matches an asid.
- *
- * Returns a positive number if @msec matches @asid.
- * Returns zero if @msec does not match @asid.
- * Returns a negative error code otherwise.
- *
- * Returns -pte_internal if @msec or @asid are NULL.
- */
-extern int pt_msec_matches_asid(const struct pt_mapped_section *msec,
-				const struct pt_asid *asid);
+	return &msec->asid;
+}
 
-/* Read memory from a mapped section.
- *
- * Reads at most @size bytes from @msec at @addr in @asid into @buffer.
- *
- * Returns the number of bytes read on success, a negative error code otherwise.
- * Returns -pte_internal, if @msec or @asid are NULL.
- * Returns -pte_invalid, if @buffer is NULL.
- * Returns -pte_nomap, if the mapped section does not contain @addr in @asid.
- */
-extern int pt_msec_read(const struct pt_mapped_section *msec, uint8_t *buffer,
-			uint16_t size, const struct pt_asid *asid,
-			uint64_t addr);
+/* Translate a section/file offset into a virtual address. */
+static inline uint64_t pt_msec_map(const struct pt_mapped_section *msec,
+				   uint64_t offset)
+{
+	return offset + msec->vaddr;
+}
 
-/* Read memory from a mapped section.
- *
- * This function is similar to the above but requires the caller to map @msec.
- *
- * Returns the number of bytes read on success, a negative error code otherwise.
- * Returns -pte_internal, if @msec or @asid are NULL.
- * Returns -pte_invalid, if @buffer is NULL.
- * Returns -pte_nomap, if the mapped section does not contain @addr in @asid.
- */
-extern int pt_msec_read_mapped(const struct pt_mapped_section *msec,
-			       uint8_t *buffer, uint16_t size,
-			       const struct pt_asid *asid, uint64_t addr);
+/* Translate a virtual address into a section/file offset. */
+static inline uint64_t pt_msec_unmap(const struct pt_mapped_section *msec,
+				     uint64_t vaddr)
+{
+	return vaddr - msec->vaddr;
+}
 
 #endif /* PT_MAPPED_SECTION_H */

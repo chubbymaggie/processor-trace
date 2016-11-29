@@ -165,7 +165,7 @@ int pt_sec_file_map(struct pt_section *section, FILE *file)
 	section->unmap = pt_sec_file_unmap;
 	section->read = pt_sec_file_read;
 
-	return 0;
+	return pt_section_add_bcache(section);
 }
 
 int pt_sec_file_unmap(struct pt_section *section)
@@ -200,7 +200,7 @@ int pt_sec_file_read(const struct pt_section *section, uint8_t *buffer,
 	int errcode;
 
 	if (!buffer || !section)
-		return -pte_invalid;
+		return -pte_internal;
 
 	mapping = section->mapping;
 	if (!mapping)

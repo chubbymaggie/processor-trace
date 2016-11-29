@@ -26,15 +26,56 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef PTUNIT_MKTEMPNAME_H
-#define PTUNIT_MKTEMPNAME_H
+#define _POSIX_C_SOURCE 200809L
 
-/* Create a name for a temporary file.
- *
- * The result is a newly allocated string, which needs to be freed with free().
- *
- * Returns a temporary file name on success, NULL otherwise.
- */
-extern char *mktempname(void);
+#include "ptunit_mkfile.h"
 
-#endif /* PTUNIT_MKTEMPNAME_H */
+#include "intel-pt.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+
+int ptunit_mkfile(FILE **pfile, char **pfilename, const char *mode)
+{
+	FILE *file;
+	const char *tmpdir;
+	const char *tmpfile;
+	char template[256], *filename;
+	int fd, len;
+
+	tmpfile = "ptunit-tmp-XXXXXX";
+	tmpdir = getenv("TMP");
+	if (!tmpdir || !tmpdir[0])
+		tmpdir = "/tmp";
+
+	len = snprintf(template, sizeof(template), "%s/%s", tmpdir, tmpfile);
+	if (len < 0)
+		return -pte_not_supported;
+
+	/* We must not truncate the template. */
+	if (sizeof(template) <= (size_t) len)
+		return -pte_not_supported;
+
+	fd = mkstemp(template);
+	if (fd == -1)
+		return -pte_not_supported;
+
+	file = fdopen(fd, mode);
+	if (!file) {
+		close(fd);
+		return -pte_not_supported;
+	}
+
+	filename = strdup(template);
+	if (!filename) {
+		fclose(file);
+		return -pte_nomem;
+	}
+
+	*pfile = file;
+	*pfilename = filename;
+
+	return 0;
+}

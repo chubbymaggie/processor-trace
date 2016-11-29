@@ -27,6 +27,8 @@
  */
 
 #include "pt_insn_decoder.h"
+#include "pt_insn.h"
+#include "pt_config.h"
 
 #include "intel-pt.h"
 
@@ -51,15 +53,41 @@ static void pt_insn_reset(struct pt_insn_decoder *decoder)
 	pt_asid_init(&decoder->asid);
 }
 
-int pt_insn_decoder_init(struct pt_insn_decoder *decoder,
-			 const struct pt_config *config)
+/* Initialize the query decoder flags based on our flags. */
+
+static int pt_insn_init_qry_flags(struct pt_conf_flags *qflags,
+				  const struct pt_conf_flags *flags)
 {
+	if (!qflags || !flags)
+		return -pte_internal;
+
+	memset(qflags, 0, sizeof(*qflags));
+
+	return 0;
+}
+
+int pt_insn_decoder_init(struct pt_insn_decoder *decoder,
+			 const struct pt_config *uconfig)
+{
+	struct pt_config config;
 	int errcode;
 
 	if (!decoder)
 		return -pte_internal;
 
-	errcode = pt_qry_decoder_init(&decoder->query, config);
+	errcode = pt_config_from_user(&config, uconfig);
+	if (errcode < 0)
+		return errcode;
+
+	/* The user supplied decoder flags. */
+	decoder->flags = config.flags;
+
+	/* Set the flags we need for the query decoder we use. */
+	errcode = pt_insn_init_qry_flags(&config.flags, &decoder->flags);
+	if (errcode < 0)
+		return errcode;
+
+	errcode = pt_qry_decoder_init(&decoder->query, &config);
 	if (errcode < 0)
 		return errcode;
 
@@ -228,253 +256,6 @@ int pt_insn_core_bus_ratio(struct pt_insn_decoder *decoder, uint32_t *cbr)
 	return pt_qry_core_bus_ratio(&decoder->query, cbr);
 }
 
-static enum pt_insn_class pt_insn_classify(const struct pt_ild *ild)
-{
-	if (!ild)
-		return ptic_error;
-
-	if (!ild->u.s.branch)
-		return ptic_other;
-
-	if (ild->u.s.cond)
-		return ptic_cond_jump;
-
-	if (ild->u.s.call)
-		return ild->u.s.branch_far ? ptic_far_call : ptic_call;
-
-	if (ild->u.s.ret)
-		return ild->u.s.branch_far ? ptic_far_return : ptic_return;
-
-	return ild->u.s.branch_far ? ptic_far_jump : ptic_jump;
-}
-
-static int pt_insn_changes_cpl(const struct pt_ild *ild)
-{
-	if (!ild)
-		return 0;
-
-	switch (ild->iclass) {
-	default:
-		return 0;
-
-	case PTI_INST_INT:
-	case PTI_INST_INT3:
-	case PTI_INST_INT1:
-	case PTI_INST_INTO:
-	case PTI_INST_IRET:
-	case PTI_INST_SYSCALL:
-	case PTI_INST_SYSENTER:
-	case PTI_INST_SYSEXIT:
-	case PTI_INST_SYSRET:
-		return 1;
-	}
-}
-
-static int pt_insn_changes_cr3(const struct pt_ild *ild)
-{
-	if (!ild)
-		return 0;
-
-	switch (ild->iclass) {
-	default:
-		return 0;
-
-	case PTI_INST_MOV_CR3:
-		return 1;
-	}
-}
-
-static int pt_insn_is_far_branch(const struct pt_ild *ild)
-{
-	if (!ild)
-		return 0;
-
-	return ild->u.s.branch_far;
-}
-
-static int pt_insn_binds_to_pip(const struct pt_ild *ild)
-{
-	if (!ild)
-		return 0;
-
-	switch (ild->iclass) {
-	default:
-		break;
-
-	case PTI_INST_MOV_CR3:
-	case PTI_INST_VMLAUNCH:
-	case PTI_INST_VMRESUME:
-		return 1;
-	}
-
-	return pt_insn_is_far_branch(ild);
-}
-
-static int pt_insn_binds_to_vmcs(const struct pt_ild *ild)
-{
-	if (!ild)
-		return 0;
-
-	switch (ild->iclass) {
-	default:
-		break;
-
-	case PTI_INST_VMPTRLD:
-	case PTI_INST_VMLAUNCH:
-	case PTI_INST_VMRESUME:
-		return 1;
-	}
-
-	return pt_insn_is_far_branch(ild);
-}
-
-/* Try to determine the next IP for @ild without using Intel PT.
- *
- * If @ip is not NULL, provides the determined IP on success.
- *
- * Returns 0 on success.
- * Returns a negative error code, otherwise.
- * Returns -pte_bad_query if determining the IP would require Intel PT.
- * Returns -pte_bad_insn if @ild has not been decoded correctly.
- * Returns -pte_invalid if @ild is NULL.
- */
-static int pt_insn_next_ip(uint64_t *ip, const struct pt_ild *ild)
-{
-	if (!ild)
-		return -pte_invalid;
-
-	if (!ild->u.s.branch) {
-		if (ip)
-			*ip = ild->runtime_address + ild->length;
-		return 0;
-	}
-
-	if (ild->u.s.cond)
-		return -pte_bad_query;
-
-	if (ild->u.s.branch_direct) {
-		if (ip)
-			*ip = ild->direct_target;
-		return 0;
-	}
-
-	return -pte_bad_query;
-}
-
-/* Decode and analyze one instruction.
- *
- * Decodes the instructruction at @decoder->ip into @insn and updates
- * @decoder->ip.
- *
- * Returns a negative error code on failure.
- * Returns zero on success if the instruction is not relevant for our purposes.
- * Returns a positive number on success if the instruction is relevant.
- * Returns -pte_bad_insn if the instruction could not be decoded.
- */
-static int decode_insn(struct pt_insn *insn, struct pt_insn_decoder *decoder)
-{
-	struct pt_ild *ild;
-	int errcode, relevant;
-	int size;
-
-	if (!insn || !decoder)
-		return -pte_internal;
-
-	/* Fill in as much as we can as early as we can so we have the
-	 * information available in case of errors.
-	 */
-	if (decoder->speculative)
-		insn->speculative = 1;
-	insn->ip = decoder->ip;
-	insn->mode = decoder->mode;
-
-	/* Read the memory at the current IP in the current address space. */
-	size = pt_image_read(decoder->image, insn->raw, sizeof(insn->raw),
-			     &decoder->asid, decoder->ip);
-	if (size < 0)
-		return size;
-
-	/* Decode the instruction. */
-	ild = &decoder->ild;
-	ild->itext = insn->raw;
-	ild->max_bytes = (uint8_t) size;
-	ild->mode = decoder->mode;
-	ild->runtime_address = decoder->ip;
-
-	errcode = pt_instruction_length_decode(ild);
-	if (errcode < 0)
-		return errcode;
-
-	insn->size = ild->length;
-
-	relevant = pt_instruction_decode(ild);
-	if (!relevant)
-		insn->iclass = ptic_other;
-	else {
-		if (relevant < 0)
-			return relevant;
-
-		insn->iclass = pt_insn_classify(ild);
-	}
-
-	return relevant;
-}
-
-/* Check whether @ip is ahead of us.
- *
- * Tries to reach @ip from @decoder->ip in @decoder->mode without Intel PT for
- * at most @steps steps.
- *
- * Does not update @decoder except for its image LRU cache.
- *
- * Returns non-zero if @ip can be reached, zero otherwise.
- */
-static int pt_ip_is_ahead(struct pt_insn_decoder *decoder, uint64_t ip,
-			  size_t steps)
-{
-	struct pt_ild ild;
-	uint8_t raw[pt_max_insn_size];
-
-	if (!decoder)
-		return 0;
-
-	/* We do not expect execution mode changes. */
-	ild.mode = decoder->mode;
-	ild.itext = raw;
-	ild.runtime_address = decoder->ip;
-
-	while (ild.runtime_address != ip) {
-		int size, errcode;
-
-		if (!steps--)
-			return 0;
-
-		/* If we can't read the memory for the instruction, we can't
-		 * reach it.
-		 */
-		size = pt_image_read(decoder->image, raw, sizeof(raw),
-				     &decoder->asid, ild.runtime_address);
-		if (size < 0)
-			return 0;
-
-		ild.max_bytes = (uint8_t) size;
-
-		errcode = pt_instruction_length_decode(&ild);
-		if (errcode < 0)
-			return 0;
-
-		errcode = pt_instruction_decode(&ild);
-		if (errcode < 0)
-			return 0;
-
-		errcode = pt_insn_next_ip(&ild.runtime_address, &ild);
-		if (errcode < 0)
-			return 0;
-	}
-
-	return 1;
-}
-
 static inline int event_pending(struct pt_insn_decoder *decoder)
 {
 	int status;
@@ -587,7 +368,7 @@ static int process_async_disabled_event(struct pt_insn_decoder *decoder,
 
 static int process_sync_disabled_event(struct pt_insn_decoder *decoder,
 				       struct pt_insn *insn,
-				       const struct pt_ild *ild)
+				       const struct pt_insn_ext *iext)
 {
 	int errcode, iperr;
 
@@ -595,16 +376,31 @@ static int process_sync_disabled_event(struct pt_insn_decoder *decoder,
 	if (errcode <= 0)
 		return errcode;
 
-	iperr = pt_insn_next_ip(&decoder->last_disable_ip, ild);
+	iperr = pt_insn_next_ip(&decoder->last_disable_ip, insn, iext);
 	if (iperr < 0) {
+		/* We don't know the IP on error. */
+		decoder->last_disable_ip = 0ull;
+
 		/* For indirect calls, assume that we return to the next
 		 * instruction.
 		 */
-		if (iperr == -pte_bad_query && ild->u.s.call)
-			decoder->last_disable_ip =
-				ild->runtime_address + ild->length;
-		else
-			decoder->last_disable_ip = 0ull;
+		if (iperr == -pte_bad_query) {
+			switch (insn->iclass) {
+			case ptic_call:
+			case ptic_far_call:
+				/* We only check the instruction class, not the
+				 * is_direct property, since direct calls would
+				 * have been handled by pt_insn_nex_ip() or
+				 * would have provoked a different error.
+				 */
+				decoder->last_disable_ip =
+					insn->ip + insn->size;
+				break;
+
+			default:
+				break;
+			}
+		}
 	}
 
 	return errcode;
@@ -626,10 +422,6 @@ static int process_async_branch_event(struct pt_insn_decoder *decoder)
 	/* Tracing must be enabled in order to make sense of the event. */
 	if (!decoder->enabled)
 		return -pte_bad_context;
-
-	/* Delay processing of the event if we can't change the IP. */
-	if (!decoder->event_may_change_ip)
-		return 0;
 
 	decoder->ip = ev->variant.async_branch.to;
 
@@ -787,34 +579,21 @@ static int process_vmcs_event(struct pt_insn_decoder *decoder)
 
 static int check_erratum_skd022(struct pt_insn_decoder *decoder)
 {
-	struct pt_ild ild;
-	uint8_t raw[pt_max_insn_size];
-	int size, errcode;
+	struct pt_insn_ext iext;
+	struct pt_insn insn;
+	int errcode;
 
 	if (!decoder)
 		return -pte_internal;
 
-	size = pt_image_read(decoder->image, raw, sizeof(raw),
-			     &decoder->asid, decoder->ip);
-	if (size < 0)
-		return 0;
+	insn.mode = decoder->mode;
+	insn.ip = decoder->ip;
 
-	memset(&ild, 0, sizeof(ild));
-
-	ild.mode = decoder->mode;
-	ild.max_bytes = (uint8_t) size;
-	ild.itext = raw;
-	ild.runtime_address = decoder->ip;
-
-	errcode = pt_instruction_length_decode(&ild);
+	errcode = pt_insn_decode(&insn, &iext, decoder->image, &decoder->asid);
 	if (errcode < 0)
 		return 0;
 
-	errcode = pt_instruction_decode(&ild);
-	if (errcode < 0)
-		return 0;
-
-	switch (ild.iclass) {
+	switch (iext.iclass) {
 	default:
 		return 0;
 
@@ -988,10 +767,10 @@ static int process_events_before(struct pt_insn_decoder *decoder,
 }
 
 static int process_one_event_after(struct pt_insn_decoder *decoder,
-				   struct pt_insn *insn)
+				   struct pt_insn *insn,
+				   const struct pt_insn_ext *iext)
 {
 	struct pt_event *ev;
-	const struct pt_ild *ild;
 
 	if (!decoder)
 		return -pte_internal;
@@ -1011,27 +790,53 @@ static int process_one_event_after(struct pt_insn_decoder *decoder,
 		return 0;
 
 	case ptev_disabled:
-		ild = &decoder->ild;
-
 		if (ev->ip_suppressed) {
-			if ((ild->u.s.branch && ild->u.s.branch_far) ||
-			    pt_insn_changes_cpl(ild) ||
-			    pt_insn_changes_cr3(ild))
+			if (pt_insn_is_far_branch(insn, iext) ||
+			    pt_insn_changes_cpl(insn, iext) ||
+			    pt_insn_changes_cr3(insn, iext))
 				return process_sync_disabled_event(decoder,
-								   insn, ild);
+								   insn, iext);
 
-		} else if (ild->u.s.branch) {
-			if (!ild->u.s.branch_direct ||
-			    ild->u.s.cond ||
-			    ild->direct_target == ev->variant.disabled.ip)
+		} else {
+			switch (insn->iclass) {
+			case ptic_other:
+				break;
+
+			case ptic_call:
+			case ptic_jump:
+				/* If we got an IP with the disabled event, we
+				 * may ignore direct branches that go to a
+				 * different IP.
+				 */
+				if (iext->variant.branch.is_direct) {
+					uint64_t ip;
+
+					ip = insn->ip;
+					ip += insn->size;
+					ip += iext->variant.branch.displacement;
+
+					if (ip != ev->variant.disabled.ip)
+						break;
+				}
+
+				/* Fall through. */
+			case ptic_return:
+			case ptic_far_call:
+			case ptic_far_return:
+			case ptic_far_jump:
+			case ptic_cond_jump:
 				return process_sync_disabled_event(decoder,
-								   insn, ild);
+								   insn, iext);
+
+			case ptic_error:
+				return -pte_bad_insn;
+			}
 		}
 
 		return 0;
 
 	case ptev_paging:
-		if (pt_insn_binds_to_pip(&decoder->ild) &&
+		if (pt_insn_binds_to_pip(insn, iext) &&
 		    !decoder->paging_event_bound) {
 			/* Each instruction only binds to one paging event. */
 			decoder->paging_event_bound = 1;
@@ -1042,7 +847,7 @@ static int process_one_event_after(struct pt_insn_decoder *decoder,
 		return 0;
 
 	case ptev_vmcs:
-		if (pt_insn_binds_to_vmcs(&decoder->ild) &&
+		if (pt_insn_binds_to_vmcs(insn, iext) &&
 		    !decoder->vmcs_event_bound) {
 			/* Each instruction only binds to one vmcs event. */
 			decoder->vmcs_event_bound = 1;
@@ -1057,7 +862,8 @@ static int process_one_event_after(struct pt_insn_decoder *decoder,
 }
 
 static int process_events_after(struct pt_insn_decoder *decoder,
-				struct pt_insn *insn)
+				struct pt_insn *insn,
+				const struct pt_insn_ext *iext)
 {
 	int pending, processed, errcode;
 
@@ -1072,7 +878,7 @@ static int process_events_after(struct pt_insn_decoder *decoder,
 	decoder->vmcs_event_bound = 0;
 
 	for (;;) {
-		processed = process_one_event_after(decoder, insn);
+		processed = process_one_event_after(decoder, insn, iext);
 		if (processed < 0)
 			return processed;
 
@@ -1091,8 +897,65 @@ static int process_events_after(struct pt_insn_decoder *decoder,
 	}
 }
 
+enum {
+	/* The maximum number of steps to take when determining whether the
+	 * event location can be reached.
+	 */
+	bdm64_max_steps	= 0x100
+};
+
+/* Try to work around erratum BDM64.
+ *
+ * If we got a transaction abort immediately following a branch that produced
+ * trace, the trace for that branch might have been corrupted.
+ *
+ * Returns a positive integer if the erratum was handled.
+ * Returns zero if the erratum does not seem to apply.
+ * Returns a negative error code otherwise.
+ */
+static int handle_erratum_bdm64(struct pt_insn_decoder *decoder,
+				const struct pt_event *ev,
+				const struct pt_insn *insn,
+				const struct pt_insn_ext *iext)
+{
+	int status;
+
+	if (!decoder || !ev || !insn || !iext)
+		return -pte_internal;
+
+	/* This only affects aborts. */
+	if (!ev->variant.tsx.aborted)
+		return 0;
+
+	/* This only affects branches. */
+	if (!pt_insn_is_branch(insn, iext))
+		return 0;
+
+	/* Let's check if we can reach the event location from here.
+	 *
+	 * If we can, let's assume the erratum did not hit.  We might still be
+	 * wrong but we're not able to tell.
+	 */
+	status = pt_insn_range_is_contiguous(decoder->ip, ev->variant.tsx.ip,
+					     decoder->mode, decoder->image,
+					     &decoder->asid, bdm64_max_steps);
+	if (status > 0)
+		return 0;
+
+	/* We can't reach the event location.  This could either mean that we
+	 * stopped too early (and status is zero) or that the erratum hit.
+	 *
+	 * We assume the latter and pretend that the previous branch brought us
+	 * to the event location, instead.
+	 */
+	decoder->ip = ev->variant.tsx.ip;
+
+	return 1;
+}
+
 static int process_one_event_peek(struct pt_insn_decoder *decoder,
-				  struct pt_insn *insn)
+				  struct pt_insn *insn,
+				  const struct pt_insn_ext *iext)
 {
 	struct pt_event *ev;
 
@@ -1120,37 +983,28 @@ static int process_one_event_peek(struct pt_insn_decoder *decoder,
 		return 0;
 
 	case ptev_tsx:
+		if (decoder->query.config.errata.bdm64) {
+			int errcode;
+
+			errcode = handle_erratum_bdm64(decoder, ev, insn, iext);
+			if (errcode < 0)
+				return errcode;
+		}
+
 		if (ev->ip_suppressed ||
 		    ev->variant.tsx.ip == decoder->ip)
 			return process_tsx_event(decoder, insn);
 
-		/* If we got the TSX event after a bogus branch, we might
-		 * be on the wrong track.
-		 *
-		 * Check if we can reach the TSX event IP from here.  If we
-		 * can't, assume that this is due to erratum BDM64.  We
-		 * pretend that we're already at the TSX event IP and process
-		 * the event.
-		 *
-		 * If we can reach the TSX event IP from here, we migth still
-		 * be wrong, but we won't be able to tell.
-		 */
-		if (decoder->query.config.errata.bdm64 &&
-		    ev->variant.tsx.aborted && decoder->ild.u.s.branch &&
-		    !pt_ip_is_ahead(decoder, ev->variant.tsx.ip, 0x1000)) {
-			decoder->ip = ev->variant.tsx.ip;
-			return process_tsx_event(decoder, insn);
-		}
-
 		return 0;
 
 	case ptev_async_branch:
-		/* The event is processed on the next iteration.
-		 *
-		 * We indicate the interrupt in the preceding instruction.
+		/* We indicate the interrupt in the preceding instruction.
 		 */
-		if (ev->variant.async_branch.from == decoder->ip)
+		if (ev->variant.async_branch.from == decoder->ip) {
 			insn->interrupted = 1;
+
+			return process_async_branch_event(decoder);
+		}
 
 		return 0;
 
@@ -1205,7 +1059,8 @@ static int process_one_event_peek(struct pt_insn_decoder *decoder,
 }
 
 static int process_events_peek(struct pt_insn_decoder *decoder,
-			       struct pt_insn *insn)
+			       struct pt_insn *insn,
+			       const struct pt_insn_ext *iext)
 {
 	if (!decoder || !insn)
 		return -pte_internal;
@@ -1220,7 +1075,7 @@ static int process_events_peek(struct pt_insn_decoder *decoder,
 		if (!pending)
 			break;
 
-		processed = process_one_event_peek(decoder, insn);
+		processed = process_one_event_peek(decoder, insn, iext);
 		if (processed < 0)
 			return processed;
 
@@ -1233,21 +1088,26 @@ static int process_events_peek(struct pt_insn_decoder *decoder,
 	return 0;
 }
 
-static int proceed(struct pt_insn_decoder *decoder)
+static int proceed(struct pt_insn_decoder *decoder, const struct pt_insn *insn,
+		   const struct pt_insn_ext *iext)
 {
-	const struct pt_ild *ild;
-
-	if (!decoder)
+	if (!decoder || !insn || !iext)
 		return -pte_internal;
 
-	ild = &decoder->ild;
+	/* Branch displacements apply to the next instruction. */
+	decoder->ip += insn->size;
 
-	if (!ild->u.s.branch) {
-		decoder->ip += ild->length;
+	/* We handle non-branches, non-taken conditional branches, and
+	 * compressed returns directly in the switch and do some pre-work for
+	 * calls.
+	 *
+	 * All kinds of branches are handled below the switch.
+	 */
+	switch (insn->iclass) {
+	case ptic_other:
 		return 0;
-	}
 
-	if (ild->u.s.cond) {
+	case ptic_cond_jump: {
 		int status, taken;
 
 		status = pt_qry_cond_branch(&decoder->query, &taken);
@@ -1255,26 +1115,25 @@ static int proceed(struct pt_insn_decoder *decoder)
 			return status;
 
 		decoder->status = status;
-		if (!taken) {
-			decoder->ip += ild->length;
+		if (!taken)
 			return 0;
-		}
 
-		/* Fall through to process the taken branch. */
-	} else if (ild->u.s.call && !ild->u.s.branch_far) {
-		uint64_t nip;
+		break;
+	}
 
+	case ptic_call:
 		/* Log the call for return compression.
 		 *
 		 * Unless this is a call to the next instruction as is used
 		 * for position independent code.
 		 */
-		nip = decoder->ip + ild->length;
-		if (!ild->u.s.branch_direct || (nip != ild->direct_target))
-			pt_retstack_push(&decoder->retstack, nip);
+		if (iext->variant.branch.displacement ||
+		    !iext->variant.branch.is_direct)
+			pt_retstack_push(&decoder->retstack, decoder->ip);
 
-		/* Fall through to process the call. */
-	} else if (ild->u.s.ret && !ild->u.s.branch_far) {
+		break;
+
+	case ptic_return: {
 		int taken, status;
 
 		/* Check for a compressed return. */
@@ -1292,12 +1151,26 @@ static int proceed(struct pt_insn_decoder *decoder)
 					       &decoder->ip);
 		}
 
-		/* Fall through to process the uncompressed return. */
+		break;
 	}
 
-	/* Process the actual branch. */
-	if (ild->u.s.branch_direct)
-		decoder->ip = ild->direct_target;
+	case ptic_jump:
+	case ptic_far_call:
+	case ptic_far_return:
+	case ptic_far_jump:
+		break;
+
+	case ptic_error:
+		return -pte_bad_insn;
+	}
+
+	/* Process a direct or indirect branch.
+	 *
+	 * This combines calls, uncompressed returns, taken conditional jumps,
+	 * and all flavors of far transfers.
+	 */
+	if (iext->variant.branch.is_direct)
+		decoder->ip += iext->variant.branch.displacement;
 	else {
 		int status;
 
@@ -1361,8 +1234,9 @@ static inline int insn_to_user(struct pt_insn *uinsn, size_t size,
 int pt_insn_next(struct pt_insn_decoder *decoder, struct pt_insn *uinsn,
 		 size_t size)
 {
+	struct pt_insn_ext iext;
 	struct pt_insn insn, *pinsn;
-	int errcode, status;
+	int errcode;
 
 	if (!uinsn || !decoder)
 		return -pte_invalid;
@@ -1401,7 +1275,13 @@ int pt_insn_next(struct pt_insn_decoder *decoder, struct pt_insn *uinsn,
 		goto err;
 	}
 
-	errcode = decode_insn(pinsn, decoder);
+	/* Decode the current instruction. */
+	if (decoder->speculative)
+		pinsn->speculative = 1;
+	pinsn->ip = decoder->ip;
+	pinsn->mode = decoder->mode;
+
+	errcode = pt_insn_decode(pinsn, &iext, decoder->image, &decoder->asid);
 	if (errcode < 0)
 		goto err;
 
@@ -1411,12 +1291,9 @@ int pt_insn_next(struct pt_insn_decoder *decoder, struct pt_insn *uinsn,
 	 */
 	decoder->event_may_change_ip = 0;
 
-	errcode = process_events_after(decoder, pinsn);
+	errcode = process_events_after(decoder, pinsn, &iext);
 	if (errcode < 0)
 		goto err;
-
-	/* We return the decoder status for this instruction. */
-	status = pt_insn_status(decoder);
 
 	/* If event processing disabled tracing, we're done for this
 	 * iteration - we will process the re-enable event on the next.
@@ -1427,14 +1304,14 @@ int pt_insn_next(struct pt_insn_decoder *decoder, struct pt_insn *uinsn,
 	 */
 	if (decoder->enabled) {
 		/* Proceed errors are signaled one instruction too early. */
-		errcode = proceed(decoder);
+		errcode = proceed(decoder, pinsn, &iext);
 		if (errcode < 0)
 			goto err;
 
 		/* Peek errors are ignored.  We will run into them again
 		 * in the next iteration.
 		 */
-		(void) process_events_peek(decoder, pinsn);
+		(void) process_events_peek(decoder, pinsn, &iext);
 	}
 
 	errcode = insn_to_user(uinsn, size, pinsn);
@@ -1444,7 +1321,7 @@ int pt_insn_next(struct pt_insn_decoder *decoder, struct pt_insn *uinsn,
 	/* We're done with this instruction.  Now we may change the IP again. */
 	decoder->event_may_change_ip = 1;
 
-	return status;
+	return pt_insn_status(decoder);
 
 err:
 	/* We provide the (incomplete) instruction also in case of errors.

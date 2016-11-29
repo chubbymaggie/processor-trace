@@ -50,6 +50,7 @@ extern "C" {
  * - Query decoder
  * - Traced image
  * - Instruction flow decoder
+ * - Block decoder
  */
 
 
@@ -58,6 +59,7 @@ struct pt_encoder;
 struct pt_packet_decoder;
 struct pt_query_decoder;
 struct pt_insn_decoder;
+struct pt_block_decoder;
 
 
 
@@ -578,6 +580,21 @@ struct pt_errata {
 	uint32_t reserved[15];
 };
 
+/** A collection of decoder-specific configuration flags. */
+struct pt_conf_flags {
+	/** The decoder variant. */
+	union {
+		/** Flags for the block decoder. */
+		struct {
+			/** End a block after a call instruction. */
+			uint32_t end_on_call:1;
+		} block;
+
+		/* Reserve a few bytes for future extensions. */
+		uint32_t reserved[4];
+	} variant;
+};
+
 /** An unknown packet. */
 struct pt_packet_unknown;
 
@@ -645,6 +662,9 @@ struct pt_config {
 	 * packets.
 	 */
 	uint8_t nom_freq;
+
+	/** A collection of decoder-specific flags. */
+	struct pt_conf_flags flags;
 };
 
 
@@ -1576,6 +1596,74 @@ static inline void pt_asid_init(struct pt_asid *asid)
 }
 
 
+/** A cache of traced image sections. */
+struct pt_image_section_cache;
+
+/** Allocate a traced memory image section cache.
+ *
+ * An optional \@name may be given to the cache.  The name string is copied.
+ *
+ * Returns a new traced memory image section cache on success, NULL otherwise.
+ */
+extern pt_export struct pt_image_section_cache *
+pt_iscache_alloc(const char *name);
+
+/** Free a traced memory image section cache.
+ *
+ * The \@iscache must have been allocated with pt_iscache_alloc().
+ * The \@iscache must not be used after a successful return.
+ */
+extern pt_export void pt_iscache_free(struct pt_image_section_cache *iscache);
+
+/** Get the image section cache name.
+ *
+ * Returns a pointer to \@iscache's name or NULL if there is no name.
+ */
+extern pt_export const char *
+pt_iscache_name(const struct pt_image_section_cache *iscache);
+
+/** Add a new file section to the traced memory image section cache.
+ *
+ * Adds a new section consisting of \@size bytes starting at \@offset in
+ * \@filename loaded at the virtual address \@vaddr if \@iscache does not
+ * already contain such a section.
+ *
+ * Returns an image section identifier (isid) uniquely identifying that section
+ * in \@iscache.
+ *
+ * The section is silently truncated to match the size of \@filename.
+ *
+ * Returns a positive isid on success, a negative error code otherwise.
+ *
+ * Returns -pte_invalid if \@iscache or \@filename is NULL.
+ * Returns -pte_invalid if \@offset is too big.
+ */
+extern pt_export int pt_iscache_add_file(struct pt_image_section_cache *iscache,
+					 const char *filename, uint64_t offset,
+					 uint64_t size, uint64_t vaddr);
+
+/** Read memory from a cached file section
+ *
+ * Reads \@size bytes of memory starting at virtual address \@vaddr in the
+ * section identified by \@isid in \@iscache into \@buffer.
+ *
+ * The caller is responsible for allocating a \@buffer of at least \@size bytes.
+ *
+ * The read request may be truncated if it crosses section boundaries or if
+ * \@size is getting too big.  We support reading at least 4Kbyte in one chunk
+ * unless the read would cross a section boundary.
+ *
+ * Returns the number of bytes read on success, a negative error code otherwise.
+ *
+ * Returns -pte_invalid if \@iscache or \@buffer is NULL.
+ * Returns -pte_invalid if \@size is zero.
+ * Returns -pte_nomap if \@vaddr is not contained in section \@isid.
+ * Returns -pte_bad_image if \@iscache does not contain \@isid.
+ */
+extern pt_export int pt_iscache_read(struct pt_image_section_cache *iscache,
+				     uint8_t *buffer, uint64_t size, int isid,
+				     uint64_t vaddr);
+
 /** The traced memory image. */
 struct pt_image;
 
@@ -1612,9 +1700,11 @@ extern pt_export const char *pt_image_name(const struct pt_image *image);
  *
  * The section is silently truncated to match the size of \@filename.
  *
+ * Existing sections that would overlap with the new section will be shrunk
+ * or split.
+ *
  * Returns zero on success, a negative error code otherwise.
  *
- * Returns -pte_bad_image if sections would overlap.
  * Returns -pte_invalid if \@image or \@filename is NULL.
  * Returns -pte_invalid if \@offset is too big.
  */
@@ -1624,12 +1714,27 @@ extern pt_export int pt_image_add_file(struct pt_image *image,
 				       const struct pt_asid *asid,
 				       uint64_t vaddr);
 
+/** Add a section from an image section cache.
+ *
+ * Add the section from \@iscache identified by \@isid in address space \@asid.
+ *
+ * Existing sections that would overlap with the new section will be shrunk
+ * or split.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ * Returns -pte_invalid if \@image or \@iscache is NULL.
+ * Returns -pte_bad_image if \@iscache does not contain \@isid.
+ */
+extern pt_export int pt_image_add_cached(struct pt_image *image,
+					 struct pt_image_section_cache *iscache,
+					 int isid, const struct pt_asid *asid);
+
 /** Copy an image.
  *
- * Adds all sections from \@src to \@image.  Sections that would overlap with
- * existing sections will be ignored.
+ * Adds all sections from \@src to \@image.  Sections that could not be added
+ * will be ignored.
  *
- * Returns the number of ignored images on success, a negative error code
+ * Returns the number of ignored sections on success, a negative error code
  * otherwise.
  *
  * Returns -pte_invalid if \@image or \@src is NULL.
@@ -1792,6 +1897,22 @@ struct pt_insn {
 
 	/** - tracing was stopped after this instruction. */
 	uint32_t stopped:1;
+
+	/** - this instruction is truncated in its image section.
+	 *
+	 *    It starts in the image section identified by \@isid and continues
+	 *    in one or more other sections.
+	 */
+	uint32_t truncated:1;
+
+	/** The image section identifier for the section containing this
+	 * instruction.
+	 *
+	 * A value of zero means that the section did not have an identifier.
+	 * The section was not added via an image section cache or the memory
+	 * was read via the read memory callback.
+	 */
+	int isid;
 };
 
 
@@ -1974,6 +2095,284 @@ extern pt_export int pt_insn_core_bus_ratio(struct pt_insn_decoder *decoder,
  */
 extern pt_export int pt_insn_next(struct pt_insn_decoder *decoder,
 				  struct pt_insn *insn, size_t size);
+
+
+
+/* Block decoder. */
+
+
+
+/** A block of instructions.
+ *
+ * Instructions in this block are executed sequentially but are not necessarily
+ * contiguous in memory.  Users are expected to follow direct branches.
+ */
+struct pt_block {
+	/** The IP of the first instruction in this block. */
+	uint64_t ip;
+
+	/** The IP of the last instruction in this block.
+	 *
+	 * This can be used for error-detection.
+	 */
+	uint64_t end_ip;
+
+	/** The image section that contains the instructions in this block.
+	 *
+	 * A value of zero means that the section did not have an identifier.
+	 * The section was not added via an image section cache or the memory
+	 * was read via the read memory callback.
+	 */
+	int isid;
+
+	/** The execution mode for all instructions in this block. */
+	enum pt_exec_mode mode;
+
+	/** The number of instructions in this block. */
+	uint16_t ninsn;
+
+	/** The raw bytes of the last instruction in this block in case the
+	 * instruction does not fit entirely into this block's section.
+	 *
+	 * This field is only valid if \@truncated is set.
+	 */
+	uint8_t raw[pt_max_insn_size];
+
+	/** The size of the last instruction in this block in bytes.
+	 *
+	 * This field is only valid if \@truncated is set.
+	 */
+	uint8_t size;
+
+	/** A collection of flags giving additional information about the
+	 * instructions in this block.
+	 *
+	 * - all instructions in this block were executed speculatively.
+	 */
+	uint32_t speculative:1;
+
+	/** - speculative execution was aborted after this block. */
+	uint32_t aborted:1;
+
+	/** - speculative execution was committed after this block. */
+	uint32_t committed:1;
+
+	/** - tracing was disabled after this block. */
+	uint32_t disabled:1;
+
+	/** - tracing was enabled at this block. */
+	uint32_t enabled:1;
+
+	/** - tracing was resumed at this block.
+	 *
+	 *    In addition to tracing being enabled, it continues from the IP
+	 *    at which tracing had been disabled before.
+	 *
+	 *    If tracing was disabled at a call instruction, we assume that
+	 *    tracing will be re-enabled after returning from the call at the
+	 *    instruction following the call instruction.
+	 */
+	uint32_t resumed:1;
+
+	/** - normal execution flow was interrupted after this block. */
+	uint32_t interrupted:1;
+
+	/** - tracing resumed at this block after an overflow. */
+	uint32_t resynced:1;
+
+	/** - tracing was stopped after this block. */
+	uint32_t stopped:1;
+
+	/** - the last instruction in this block is truncated.
+	 *
+	 *    It starts in this block's section but continues in one or more
+	 *    other sections depending on how fragmented the memory image is.
+	 *
+	 *    The raw bytes for the last instruction are provided in \@raw and
+	 *    its size in \@size in this case.
+	 */
+	uint32_t truncated:1;
+};
+
+/** Allocate an Intel PT block decoder.
+ *
+ * The decoder will work on the buffer defined in \@config, it shall contain
+ * raw trace data and remain valid for the lifetime of the decoder.
+ *
+ * The decoder needs to be synchronized before it can be used.
+ */
+extern pt_export struct pt_block_decoder *
+pt_blk_alloc_decoder(const struct pt_config *config);
+
+/** Free an Intel PT block decoder.
+ *
+ * This will destroy the decoder's default image.
+ *
+ * The \@decoder must not be used after a successful return.
+ */
+extern pt_export void pt_blk_free_decoder(struct pt_block_decoder *decoder);
+
+/** Synchronize an Intel PT block decoder.
+ *
+ * Search for the next synchronization point in forward or backward direction.
+ *
+ * If \@decoder has not been synchronized, yet, the search is started at the
+ * beginning of the trace buffer in case of forward synchronization and at the
+ * end of the trace buffer in case of backward synchronization.
+ *
+ * Returns zero or a positive value on success, a negative error code otherwise.
+ *
+ * Returns -pte_bad_opc if an unknown packet is encountered.
+ * Returns -pte_bad_packet if an unknown packet payload is encountered.
+ * Returns -pte_eos if no further synchronization point is found.
+ * Returns -pte_invalid if \@decoder is NULL.
+ */
+extern pt_export int pt_blk_sync_forward(struct pt_block_decoder *decoder);
+extern pt_export int pt_blk_sync_backward(struct pt_block_decoder *decoder);
+
+/** Manually synchronize an Intel PT block decoder.
+ *
+ * Synchronize \@decoder on the syncpoint at \@offset.  There must be a PSB
+ * packet at \@offset.
+ *
+ * Returns zero or a positive value on success, a negative error code otherwise.
+ *
+ * Returns -pte_bad_opc if an unknown packet is encountered.
+ * Returns -pte_bad_packet if an unknown packet payload is encountered.
+ * Returns -pte_eos if \@offset lies outside of \@decoder's trace buffer.
+ * Returns -pte_eos if \@decoder reaches the end of its trace buffer.
+ * Returns -pte_invalid if \@decoder is NULL.
+ * Returns -pte_nosync if there is no syncpoint at \@offset.
+ */
+extern pt_export int pt_blk_sync_set(struct pt_block_decoder *decoder,
+				     uint64_t offset);
+
+/** Get the current decoder position.
+ *
+ * Fills the current \@decoder position into \@offset.
+ *
+ * This is useful for reporting errors.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ *
+ * Returns -pte_invalid if \@decoder or \@offset is NULL.
+ * Returns -pte_nosync if \@decoder is out of sync.
+ */
+extern pt_export int pt_blk_get_offset(struct pt_block_decoder *decoder,
+				       uint64_t *offset);
+
+/** Get the position of the last synchronization point.
+ *
+ * Fills the last synchronization position into \@offset.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ *
+ * Returns -pte_invalid if \@decoder or \@offset is NULL.
+ * Returns -pte_nosync if \@decoder is out of sync.
+ */
+extern pt_export int pt_blk_get_sync_offset(struct pt_block_decoder *decoder,
+					    uint64_t *offset);
+
+/** Get the traced image.
+ *
+ * The returned image may be modified as long as \@decoder is not running.
+ *
+ * Returns a pointer to the traced image \@decoder uses for reading memory.
+ * Returns NULL if \@decoder is NULL.
+ */
+extern pt_export struct pt_image *
+pt_blk_get_image(struct pt_block_decoder *decoder);
+
+/** Set the traced image.
+ *
+ * Sets the image that \@decoder uses for reading memory to \@image.  If \@image
+ * is NULL, sets the image to \@decoder's default image.
+ *
+ * Only one image can be active at any time.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ * Return -pte_invalid if \@decoder is NULL.
+ */
+extern pt_export int pt_blk_set_image(struct pt_block_decoder *decoder,
+				      struct pt_image *image);
+
+/* Return a pointer to \@decoder's configuration.
+ *
+ * Returns a non-null pointer on success, NULL if \@decoder is NULL.
+ */
+extern pt_export const struct pt_config *
+pt_blk_get_config(const struct pt_block_decoder *decoder);
+
+/** Return the current time.
+ *
+ * On success, provides the time at \@decoder's current position in \@time.
+ * Since \@decoder is reading ahead until the next indirect branch or event,
+ * the value matches the time for that branch or event.
+ *
+ * The time is similar to what a rdtsc instruction would return.  Depending
+ * on the configuration, the time may not be fully accurate.  If TSC is not
+ * enabled, the time is relative to the last synchronization and can't be used
+ * to correlate with other TSC-based time sources.  In this case, -pte_no_time
+ * is returned and the relative time is provided in \@time.
+ *
+ * Some timing-related packets may need to be dropped (mostly due to missing
+ * calibration or incomplete configuration).  To get an idea about the quality
+ * of the estimated time, we record the number of dropped MTC and CYC packets.
+ *
+ * If \@lost_mtc is not NULL, set it to the number of lost MTC packets.
+ * If \@lost_cyc is not NULL, set it to the number of lost CYC packets.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ *
+ * Returns -pte_invalid if \@decoder or \@time is NULL.
+ * Returns -pte_no_time if there has not been a TSC packet.
+ */
+extern pt_export int pt_blk_time(struct pt_block_decoder *decoder,
+				 uint64_t *time, uint32_t *lost_mtc,
+				 uint32_t *lost_cyc);
+
+/** Return the current core bus ratio.
+ *
+ * On success, provides the core:bus ratio at \@decoder's current position
+ * in \@cbr.
+ * Since \@decoder is reading ahead until the next indirect branch or event,
+ * the value matches the core:bus ratio for that branch or event.
+ *
+ * The ratio is defined as core cycles per bus clock cycle.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ *
+ * Returns -pte_invalid if \@decoder or \@cbr is NULL.
+ * Returns -pte_no_cbr if there has not been a CBR packet.
+ */
+extern pt_export int pt_blk_core_bus_ratio(struct pt_block_decoder *decoder,
+					   uint32_t *cbr);
+
+/** Determine the next block of instructions.
+ *
+ * On success, provides the next block of instructions in execution order in
+ * \@block.
+ *
+ * The \@size argument must be set to sizeof(struct pt_block).
+ *
+ * Returns a non-negative pt_status_flag bit-vector on success, a negative error
+ * code otherwise.
+ *
+ * Returns pts_eos to indicate the end of the trace stream.  Subsequent calls
+ * to pt_block_next() will continue to return pts_eos until trace is required
+ * to determine the next instruction.
+ *
+ * Returns -pte_bad_context if the decoder encountered an unexpected packet.
+ * Returns -pte_bad_opc if the decoder encountered unknown packets.
+ * Returns -pte_bad_packet if the decoder encountered unknown packet payloads.
+ * Returns -pte_bad_query if the decoder got out of sync.
+ * Returns -pte_eos if decoding reached the end of the Intel PT buffer.
+ * Returns -pte_invalid if \@decoder or \@block is NULL.
+ * Returns -pte_nomap if the memory at the instruction address can't be read.
+ * Returns -pte_nosync if \@decoder is out of sync.
+ */
+extern pt_export int pt_blk_next(struct pt_block_decoder *decoder,
+				 struct pt_block *block, size_t size);
 
 #ifdef __cplusplus
 }

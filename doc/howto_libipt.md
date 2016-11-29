@@ -56,6 +56,12 @@ are organized as follows:
   * *instruction flow*      This layer deals with the execution flow on the
                             instruction level.
 
+  * *block*                 This layer deals with the execution flow on the
+                            instruction level.
+
+                            It is faster than the instruction flow decoder but
+                            requires a small amount of post-processing.
+
 
 Each layer provides its own encoder or decoder struct plus a set of functions
 for allocating and freeing encoder or decoder objects and for synchronizing
@@ -67,6 +73,7 @@ abbreviations are used:
   * *pkt*     Packet decoding (packet layer).
   * *qry*     Event (or query) layer.
   * *insn*    Instruction flow layer.
+  * *blk*     Block layer.
 
 
 Here is some generic example code for working with decoders:
@@ -662,8 +669,10 @@ this if you only use one decoder and one image.
 
 An image is a collection of contiguous, non-overlapping memory regions called
 `sections`.  Starting with an empty image, it may be populated with repeated
-calls to `pt_image_add_file()`, one for each section, or with a call to
-`pt_image_copy()` to add all sections from another image.
+calls to `pt_image_add_file()` or `pt_image_add_cached()`, one for each section,
+or with a call to `pt_image_copy()` to add all sections from another image.  If
+a newly added section overlaps with an existing section, the existing section
+will be truncated or split to make room for the new section.
 
 In some cases, the memory image may change during the execution.  You can use
 the `pt_image_remove_by_filename()` function to remove previously added sections
@@ -687,6 +696,28 @@ images for different processes at the same time.  The decoder will select the
 correct image based on context switch information in the Intel PT trace.  If
 you want to manage this on your own, you can use `pt_insn_set_image()` to
 replace the image a decoder uses.
+
+
+#### The Traced Image Section Cache
+
+When using multiple decoders that work on related memory images it is desirable
+to share image sections between decoders.  The underlying file sections will be
+mapped only once per image section cache.
+
+Use `pt_iscache_alloc()` to allocate and `pt_iscache_free()` to free an image
+section cache.  Freeing the cache does not destroy sections added to the cache.
+They remain valid until they are no longer used.
+
+Use `pt_iscache_add_file()` to add a file section to an image section cache.
+The function returns an image section identifier (ISID) that uniquely identifies
+the section in this cache.  Use `pt_image_add_cached()` to add a file section
+from an image section cache to an image.
+
+Multiple image section caches may be used at the same time but it is recommended
+not to mix sections from different image section caches in one image.
+
+A traced image section cache can also be used for reading an instruction's
+memory via its IP and ISID as provided in `struct pt_insn`.
 
 
 #### Synchronizing
@@ -745,7 +776,7 @@ example:
     for (;;) {
         struct pt_insn insn;
 
-        errcode = pt_insn_next(decoder, &insn);
+        errcode = pt_insn_next(decoder, &insn, sizeof(insn));
 
         if (insn.iclass != ptic_error)
             <process instruction>(&insn);
@@ -755,11 +786,16 @@ example:
     }
 ~~~
 
-For each instruction, you get its IP, its size in bytes, the raw memory, the
-current execution mode, and the speculation state, that is whether the
-instruction has been executed speculatively.  In addition, you get a coarse
-classification that can be used for further processing without the need for a
-full instruction decode.
+For each instruction, you get its IP, its size in bytes, the raw memory, an
+identifier for the image section that contained it, the current execution mode,
+and the speculation state, that is whether the instruction has been executed
+speculatively.  In addition, you get a coarse classification that can be used
+for further processing without the need for a full instruction decode.
+
+If a traced image section cache is used the image section identifier can be used
+to trace an instruction back to the binary file that contained it.  This allows
+mapping the instruction back to source code using the debug information
+contained in or reachable via the binary file.
 
 You also get some information about events that occured either before or after
 executing the instruction like enable or disable tracing.  For detailed
@@ -768,6 +804,157 @@ the intel-pt.h header file.
 
 Beware that `pt_insn_next()` may indicate errors that occur after the returned
 instruction.  The returned instruction is valid if its `iclass` field is set.
+
+
+## The Block Layer
+
+The block layer provides a simple API for iterating over blocks of sequential
+instructions in execution order.  The instructions in a block are sequential in
+the sense that no trace is required for reconstructing the instructions.  The IP
+of the first instruction is given in `struct pt_block` and the IP of other
+instructions in the block can be determined by decoding and examining the
+previous instruction.
+
+Start by configuring and allocating a `pt_block_decoder` as shown below:
+
+~~~{.c}
+    struct pt_block_decoder *decoder;
+    struct pt_config config;
+
+    memset(&config, 0, sizeof(config));
+    config.size = sizeof(config);
+    config.begin = <pt buffer begin>;
+    config.end = <pt buffer end>;
+    config.cpu = <cpu identifier>;
+    config.decode.callback = <decode function>;
+    config.decode.context = <decode context>;
+
+    decoder = pt_blk_alloc_decoder(&config);
+~~~
+
+An optional packet decode callback function may be specified in addition to the
+mandatory config fields.  If specified, the callback function will be called for
+packets the decoder does not know about.  The decoder will ignore the unknown
+packet except for its size in order to skip it.  If there is no decode callback
+specified, the decoder will abort with `-pte_bad_opc`.  In addition to the
+callback function pointer, an optional pointer to user-defined context
+information can be specified.  This context will be passed to the decode
+callback function.
+
+
+#### Synchronizing
+
+Before the decoder can be used, it needs to be synchronized onto the Intel PT
+packet stream.  To iterate over synchronization points in the Intel PT packet
+stream in forward or backward directions, the block decoder offers the following
+two synchronization functions respectively:
+
+    pt_blk_sync_forward()
+    pt_blk_sync_backward()
+
+
+To manually synchronize the decoder at a synchronization point (i.e. PSB packet)
+in the Intel PT packet stream, use the following function:
+
+    pt_blk_sync_set()
+
+
+The example below shows synchronization to the first synchronization point:
+
+~~~{.c}
+    struct pt_block_decoder *decoder;
+    int errcode;
+
+    errcode = pt_blk_sync_forward(decoder);
+    if (errcode < 0)
+        <handle error>(errcode);
+~~~
+
+The decoder will remember the last synchronization packet it decoded.
+Subsequent calls to `pt_blk_sync_forward` and `pt_blk_sync_backward` will use
+this as their starting point.
+
+You can get the current decoder position as offset into the Intel PT buffer via:
+
+    pt_blk_get_offset()
+
+
+You can get the position of the last synchronization point as offset into the
+Intel PT buffer via:
+
+    pt_blk_get_sync_offset()
+
+
+#### Iterating
+
+Once the decoder is synchronized, it can be used to iterate over blocks of
+instructions in execution flow order by repeated calls to `pt_blk_next()` as
+shown in the following example:
+
+~~~{.c}
+    struct pt_block_decoder *decoder;
+    int errcode;
+
+    for (;;) {
+        struct pt_block block;
+
+        errcode = pt_blk_next(decoder, &block, sizeof(block));
+
+        if (block.ninsn > 0)
+            <process block>(&block);
+
+        if (errcode < 0)
+            break;
+    }
+~~~
+
+A block contains enough information to reconstruct the instructions.  See
+`struct pt_block` in `intel-pt.h` for details.  Note that errors returned by
+`pt_blk_next()` apply after the last instruction in the provided block.
+
+It is recommended to use a traced image section cache so the image section
+identifier contained in a block can be used for reading the memory containing
+the instructions in the block.  This also allows mapping the instructions back
+to source code using the debug information contained in or reachable via the
+binary file.
+
+In some cases, the last instruction in a block may cross image section
+boundaries.  This can happen when a code segment is split into more than one
+image section.  The block is marked truncated in this case and provides the raw
+bytes of the last instruction.
+
+The following example shows how instructions can be reconstructed from a block:
+
+~~~{.c}
+    struct pt_image_section_cache *iscache;
+    struct pt_block *block;
+    uint16_t ninsn;
+    uint64_t ip;
+
+    ip = block->ip;
+    for (ninsn = 0; ninsn < block->ninsn; ++ninsn) {
+        uint8_t raw[pt_max_insn_size];
+        <struct insn> insn;
+        int size;
+
+        if (block->truncated && ((ninsn +1) == block->ninsn)) {
+            memcpy(raw, block->raw, block->size);
+            size = block->size;
+        } else {
+            size = pt_iscache_read(iscache, raw, sizeof(raw), block->isid, ip);
+            if (size < 0)
+                break;
+        }
+
+        errcode = <decode instruction>(&insn, raw, size, block->mode);
+        if (errcode < 0)
+            break;
+
+        <process instruction>(&insn);
+
+        ip = <determine next ip>(&insn);
+    }
+~~~
 
 
 ## Parallel Decode
@@ -797,8 +984,8 @@ the next step.
     }
 ~~~
 
-The individual trace segments can then be decoded using the query or instruction
-flow decoder as shown above in the previous examples.
+The individual trace segments can then be decoded using the query, instruction
+flow, or block decoder as shown above in the previous examples.
 
 When stitching decoded trace segments together, a sequence of linear (in the
 sense that it can be decoded without Intel PT) code has to be filled in.  Use
@@ -813,7 +1000,7 @@ shown in the following example:
     int status;
 
     for (;;) {
-        status = pt_insn_next(decoder, &insn);
+        status = pt_insn_next(decoder, &insn, sizeof(insn));
         if (status < 0)
             <handle error>(status);
 
@@ -826,7 +1013,7 @@ shown in the following example:
     while (insn.ip != <next segment's start IP>) {
         <process instruction>(&insn);
 
-        status = pt_insn_next(decoder, &insn);
+        status = pt_insn_next(decoder, &insn, sizeof(insn));
         if (status < 0)
             <handle error>(status);
     }

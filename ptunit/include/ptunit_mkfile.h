@@ -26,23 +26,23 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifndef PTUNIT_MKFILE_H
+#define PTUNIT_MKFILE_H
+
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 
-char *mktempname(void)
-{
-	char tmp[L_tmpnam];
-	char *result;
+/* Create a temporary file for unit testing.
+ *
+ * Creates a new file and opens it with @mode.  On success, provides the file
+ * struct and file name in @file and @filename respectively.
+ *
+ * The @file needs to be closed and the @filename needs to be freed after use.
+ *
+ * Returns zero on success, a negative error code otherwise.
+ * Returns -pte_internal if @file or @filename is NULL.
+ * Returns -pte_nomem if @filename can't be allocated.
+ */
+int ptunit_mkfile(FILE **file, char **filename, const char *mode);
 
-	result = tmpnam(tmp);
-	if (!result)
-		return NULL;
-
-	result = malloc(strlen(tmp) + 1);
-	if (!result)
-		return NULL;
-
-	return strcpy(result, tmp);
-}
+#endif /* PTUNIT_MKFILE_H */

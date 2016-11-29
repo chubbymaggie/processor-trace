@@ -26,9 +26,47 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
+#include "ptunit_mkfile.h"
 
-char *mktempname(void)
+#include "intel-pt.h"
+
+#include <windows.h>
+#include <string.h>
+
+
+int ptunit_mkfile(FILE **pfile, char **pfilename, const char *mode)
 {
-	return _tempnam(NULL, NULL);
+	char dirbuffer[MAX_PATH], buffer[MAX_PATH], *filename;
+	const char *dirname;
+	FILE *file;
+	DWORD dirlen;
+	UINT status;
+
+	/* We only support char-based strings. */
+	if (sizeof(TCHAR) != sizeof(char))
+		return -pte_not_supported;
+
+	dirname = dirbuffer;
+	dirlen = GetTempPath(sizeof(dirbuffer), dirbuffer);
+	if (!dirlen || dirlen >= sizeof(dirbuffer))
+		dirname = ".";
+
+	status = GetTempFileName(dirname, "ptunit-tmp-", 0, buffer);
+	if (!status)
+		return -pte_not_supported;
+
+	file = fopen(buffer, mode);
+	if (!file)
+		return -pte_not_supported;
+
+	filename = _strdup(buffer);
+	if (!filename) {
+		fclose(file);
+		return -pte_nomem;
+	}
+
+	*pfile = file;
+	*pfilename = filename;
+
+	return 0;
 }

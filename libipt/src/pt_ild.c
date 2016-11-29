@@ -323,8 +323,7 @@ static int imm_dec(struct pt_ild *ild, uint8_t length)
 			return -pte_bad_insn;
 
 		ild->nominal_opcode = get_byte(ild, length);
-		ild->length = length + 1;
-		return 0;
+		return length + 1;
 	}
 
 	errcode = set_imm_bytes(ild);
@@ -336,8 +335,7 @@ static int imm_dec(struct pt_ild *ild, uint8_t length)
 	if (ild->max_bytes < length)
 		return -pte_bad_insn;
 
-	ild->length = length;
-	return 0;
+	return length;
 }
 
 static int compute_disp_dec(struct pt_ild *ild)
@@ -859,50 +857,29 @@ static int decode(struct pt_ild *ild)
 	return prefix_decode(ild, 0, 0);
 }
 
-static inline int64_t sign_extend_bq(int8_t x)
+static int set_branch_target(struct pt_insn_ext *iext, const struct pt_ild *ild)
 {
-	return x;
-}
-
-static inline int64_t sign_extend_wq(int16_t x)
-{
-	return x;
-}
-
-static inline int64_t sign_extend_dq(int32_t x)
-{
-	return x;
-}
-
-static int set_branch_target(struct pt_ild *ild)
-{
-	int64_t npc;
-	uint64_t sign_extended_disp = 0;
-
-	if (!ild)
+	if (!iext || !ild)
 		return -pte_internal;
 
-	if (ild->disp_bytes == 1)
-		sign_extended_disp =
-		    sign_extend_bq(get_byte(ild, ild->disp_pos));
-	else if (ild->disp_bytes == 2) {
+	iext->variant.branch.is_direct = 1;
+
+	if (ild->disp_bytes == 1) {
+		int8_t *b = (int8_t *) (get_byte_ptr(ild, ild->disp_pos));
+
+		iext->variant.branch.displacement = *b;
+	} else if (ild->disp_bytes == 2) {
 		int16_t *w = (int16_t *) (get_byte_ptr(ild, ild->disp_pos));
 
-		sign_extended_disp = sign_extend_wq(*w);
+		iext->variant.branch.displacement = *w;
 	} else if (ild->disp_bytes == 4) {
 		int32_t *d = (int32_t *) (get_byte_ptr(ild, ild->disp_pos));
 
-		sign_extended_disp = sign_extend_dq(*d);
+		iext->variant.branch.displacement = *d;
 	} else
 		return -pte_bad_insn;
 
-	npc = (int64_t) (ild->runtime_address + ild->length);
-	ild->direct_target = (uint64_t) (npc + sign_extended_disp);
-
-	/* We return 1 to indicate an interesting instruction so our caller can
-	 * just forward the return value.
-	 */
-	return 1;
+	return 0;
 }
 
 /*  MAIN ENTRY POINTS */
@@ -915,7 +892,7 @@ void pt_ild_init(void)
 	init_prefix_table();
 }
 
-int pt_instruction_length_decode(struct pt_ild *ild)
+static int pt_instruction_length_decode(struct pt_ild *ild)
 {
 	if (!ild)
 		return -pte_internal;
@@ -933,14 +910,18 @@ int pt_instruction_length_decode(struct pt_ild *ild)
 	return decode(ild);
 }
 
-int pt_instruction_decode(struct pt_ild *ild)
+static int pt_instruction_decode(struct pt_insn *insn, struct pt_insn_ext *iext,
+				 const struct pt_ild *ild)
 {
 	uint8_t opcode, map;
 
-	if (!ild)
+	if (!iext || !ild)
 		return -pte_internal;
 
-	ild->iclass = PTI_INST_INVALID;
+	iext->iclass = PTI_INST_INVALID;
+	memset(&iext->variant, 0, sizeof(iext->variant));
+
+	insn->iclass = ptic_other;
 
 	opcode = ild->nominal_opcode;
 	map = ild->map;
@@ -953,21 +934,19 @@ int pt_instruction_decode(struct pt_ild *ild)
 	/* PTI_INST_JCC,   70...7F, 0F (0x80...0x8F) */
 	if (opcode >= 0x70 && opcode <= 0x7F) {
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_JCC;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			ild->u.s.cond = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_cond_jump;
+			iext->iclass = PTI_INST_JCC;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 	}
 	if (opcode >= 0x80 && opcode <= 0x8F) {
 		if (map == PTI_MAP_1) {
-			ild->iclass = PTI_INST_JCC;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			ild->u.s.cond = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_cond_jump;
+			iext->iclass = PTI_INST_JCC;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 	}
@@ -975,11 +954,8 @@ int pt_instruction_decode(struct pt_ild *ild)
 	switch (ild->nominal_opcode) {
 	case 0x9A:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_CALL_9A;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.call = 1;
-			return 1;
+			insn->iclass = ptic_far_call;
+			iext->iclass = PTI_INST_CALL_9A;
 		}
 		return 0;
 
@@ -988,229 +964,184 @@ int pt_instruction_decode(struct pt_ild *ild)
 			uint8_t reg = pti_get_modrm_reg(ild);
 
 			if (reg == 2) {
-				ild->iclass = PTI_INST_CALL_FFr2;
-				ild->u.s.branch = 1;
-				ild->u.s.call = 1;
-				return 1;
+				insn->iclass = ptic_call;
+				iext->iclass = PTI_INST_CALL_FFr2;
 			} else if (reg == 3) {
-				ild->iclass = PTI_INST_CALL_FFr3;
-				ild->u.s.branch = 1;
-				ild->u.s.branch_far = 1;
-				ild->u.s.call = 1;
-				return 1;
+				insn->iclass = ptic_far_call;
+				iext->iclass = PTI_INST_CALL_FFr3;
 			} else if (reg == 4) {
-				ild->iclass = PTI_INST_JMP_FFr4;
-				ild->u.s.branch = 1;
-				return 1;
+				insn->iclass = ptic_jump;
+				iext->iclass = PTI_INST_JMP_FFr4;
 			} else if (reg == 5) {
-				ild->iclass = PTI_INST_JMP_FFr5;
-				ild->u.s.branch = 1;
-				ild->u.s.branch_far = 1;
-				return 1;
+				insn->iclass = ptic_far_jump;
+				iext->iclass = PTI_INST_JMP_FFr5;
 			}
 		}
 		return 0;
 
 	case 0xE8:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_CALL_E8;
-			ild->u.s.branch = 1;
-			ild->u.s.call = 1;
-			ild->u.s.branch_direct = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_call;
+			iext->iclass = PTI_INST_CALL_E8;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 
 	case 0xCD:
-		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_INT;
-			return 1;
-		}
+		if (map == PTI_MAP_0)
+			iext->iclass = PTI_INST_INT;
+
 		return 0;
 
 	case 0xCC:
-		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_INT3;
-			return 1;
-		}
+		if (map == PTI_MAP_0)
+			iext->iclass = PTI_INST_INT3;
+
 		return 0;
 
 	case 0xCE:
-		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_INTO;
-			return 1;
-		}
+		if (map == PTI_MAP_0)
+			iext->iclass = PTI_INST_INTO;
+
 		return 0;
 
 	case 0xF1:
-		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_INT1;
-			return 1;
-		}
+		if (map == PTI_MAP_0)
+			iext->iclass = PTI_INST_INT1;
+
 		return 0;
 
 	case 0xCF:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_IRET;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.ret = 1;
-			return 1;
+			insn->iclass = ptic_far_return;
+			iext->iclass = PTI_INST_IRET;
 		}
 		return 0;
 
 	case 0xE9:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_JMP_E9;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_jump;
+			iext->iclass = PTI_INST_JMP_E9;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 
 	case 0xEA:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_JMP_EA;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			/* FIXME: We do not set the branch target. */
-			return 1;
+			/* Far jumps are treated as indirect jumps. */
+			insn->iclass = ptic_far_jump;
+			iext->iclass = PTI_INST_JMP_EA;
 		}
 		return 0;
 
 	case 0xEB:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_JMP_EB;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			return set_branch_target(ild);
-	}
+			insn->iclass = ptic_jump;
+			iext->iclass = PTI_INST_JMP_EB;
+
+			return set_branch_target(iext, ild);
+		}
 		return 0;
 
 	case 0xE3:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_JrCXZ;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			ild->u.s.cond = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_cond_jump;
+			iext->iclass = PTI_INST_JrCXZ;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 
 	case 0xE0:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_LOOPNE;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			ild->u.s.cond = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_cond_jump;
+			iext->iclass = PTI_INST_LOOPNE;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 
 	case 0xE1:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_LOOPE;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			ild->u.s.cond = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_cond_jump;
+			iext->iclass = PTI_INST_LOOPE;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 
 	case 0xE2:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_LOOP;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_direct = 1;
-			ild->u.s.cond = 1;
-			return set_branch_target(ild);
+			insn->iclass = ptic_cond_jump;
+			iext->iclass = PTI_INST_LOOP;
+
+			return set_branch_target(iext, ild);
 		}
 		return 0;
 
 	case 0x22:
 		if (map == PTI_MAP_1)
 			if (pti_get_modrm_reg(ild) == 3)
-				if (!ild->u.s.rex_r) {
-					ild->iclass = PTI_INST_MOV_CR3;
-					return 1;
-				}
+				if (!ild->u.s.rex_r)
+					iext->iclass = PTI_INST_MOV_CR3;
+
 		return 0;
 
 	case 0xC3:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_RET_C3;
-			ild->u.s.branch = 1;
-			ild->u.s.ret = 1;
-			return 1;
+			insn->iclass = ptic_return;
+			iext->iclass = PTI_INST_RET_C3;
 		}
 		return 0;
 
 	case 0xC2:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_RET_C2;
-			ild->u.s.branch = 1;
-			ild->u.s.ret = 1;
-			return 1;
+			insn->iclass = ptic_return;
+			iext->iclass = PTI_INST_RET_C2;
 		}
 		return 0;
 
 	case 0xCB:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_RET_CB;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.ret = 1;
-			return 1;
+			insn->iclass = ptic_far_return;
+			iext->iclass = PTI_INST_RET_CB;
 		}
 		return 0;
 
 	case 0xCA:
 		if (map == PTI_MAP_0) {
-			ild->iclass = PTI_INST_RET_CA;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.ret = 1;
-			return 1;
+			insn->iclass = ptic_far_return;
+			iext->iclass = PTI_INST_RET_CA;
 		}
 		return 0;
 
 	case 0x05:
 		if (map == PTI_MAP_1) {
-			ild->iclass = PTI_INST_SYSCALL;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.call = 1;
-			return 1;
+			insn->iclass = ptic_far_call;
+			iext->iclass = PTI_INST_SYSCALL;
 		}
 		return 0;
 
 	case 0x34:
 		if (map == PTI_MAP_1) {
-			ild->iclass = PTI_INST_SYSENTER;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.call = 1;
-			return 1;
+			insn->iclass = ptic_far_call;
+			iext->iclass = PTI_INST_SYSENTER;
 		}
 		return 0;
 
 	case 0x35:
 		if (map == PTI_MAP_1) {
-			ild->iclass = PTI_INST_SYSEXIT;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.ret = 1;
-			return 1;
+			insn->iclass = ptic_far_return;
+			iext->iclass = PTI_INST_SYSEXIT;
 		}
 		return 0;
 
 	case 0x07:
 		if (map == PTI_MAP_1) {
-			ild->iclass = PTI_INST_SYSRET;
-			ild->u.s.branch = 1;
-			ild->u.s.branch_far = 1;
-			ild->u.s.ret = 1;
-			return 1;
+			insn->iclass = ptic_far_return;
+			iext->iclass = PTI_INST_SYSRET;
 		}
 		return 0;
 
@@ -1218,28 +1149,22 @@ int pt_instruction_decode(struct pt_ild *ild)
 		if (map == PTI_MAP_1) {
 			switch (ild->modrm_byte) {
 			case 0xc1:
-				ild->iclass = PTI_INST_VMCALL;
-				ild->u.s.branch = 1;
-				ild->u.s.branch_far = 1;
-				ild->u.s.ret = 1;
-				return 1;
+				insn->iclass = ptic_far_return;
+				iext->iclass = PTI_INST_VMCALL;
+				break;
 
 			case 0xc2:
-				ild->iclass = PTI_INST_VMLAUNCH;
-				ild->u.s.branch = 1;
-				ild->u.s.branch_far = 1;
-				ild->u.s.call = 1;
-				return 1;
+				insn->iclass = ptic_far_call;
+				iext->iclass = PTI_INST_VMLAUNCH;
+				break;
 
 			case 0xc3:
-				ild->iclass = PTI_INST_VMRESUME;
-				ild->u.s.branch = 1;
-				ild->u.s.branch_far = 1;
-				ild->u.s.call = 1;
-				return 1;
+				insn->iclass = ptic_far_call;
+				iext->iclass = PTI_INST_VMRESUME;
+				break;
 
 			default:
-				return 0;
+				break;
 			}
 		}
 		return 0;
@@ -1247,16 +1172,33 @@ int pt_instruction_decode(struct pt_ild *ild)
 	case 0xc7:
 		if (map == PTI_MAP_1 &&
 		    pti_get_modrm_mod(ild) != 3 &&
-		    pti_get_modrm_reg(ild) == 6) {
-			ild->iclass = PTI_INST_VMPTRLD;
-			return 1;
-		}
+		    pti_get_modrm_reg(ild) == 6)
+			iext->iclass = PTI_INST_VMPTRLD;
+
 		return 0;
 
 	default:
-		break;
+		return 0;
 	}
+}
 
-	return 0;
+int pt_ild_decode(struct pt_insn *insn, struct pt_insn_ext *iext)
+{
+	struct pt_ild ild;
+	int size;
 
+	if (!insn || !iext)
+		return -pte_internal;
+
+	ild.mode = insn->mode;
+	ild.itext = insn->raw;
+	ild.max_bytes = insn->size;
+
+	size = pt_instruction_length_decode(&ild);
+	if (size < 0)
+		return size;
+
+	insn->size = (uint8_t) size;
+
+	return pt_instruction_decode(insn, iext, &ild);
 }
